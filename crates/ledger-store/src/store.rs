@@ -23,10 +23,10 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
-fn invalid(message: &str) -> StoreError {
+pub(crate) fn invalid(message: &str) -> StoreError {
     StoreError::Conflict(message.into())
 }
-fn now() -> String {
+pub(crate) fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
@@ -62,6 +62,7 @@ pub struct AccountInput {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct JournalLine {
+    pub id: i64,
     pub account_id: i64,
     pub account_code: String,
     pub account_name: String,
@@ -103,6 +104,7 @@ pub struct Snapshot {
     pub journal_count: i64,
     pub journal_activity: BTreeMap<String, i64>,
     pub trial_balance: TrialBalance,
+    pub statements: crate::FinancialStatements,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct LedgerLine {
@@ -126,6 +128,8 @@ pub struct Ledger {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BackupLine {
+    #[serde(default)]
+    id: Option<i64>,
     account_id: i64,
     side: Side,
     amount_minor: String,
@@ -133,6 +137,8 @@ struct BackupLine {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BackupJournal {
+    #[serde(default = "manual_source")]
+    source: String,
     id: i64,
     date: String,
     reference: String,
@@ -151,6 +157,8 @@ struct Backup {
     company: Company,
     accounts: Vec<Account>,
     journals: Vec<BackupJournal>,
+    #[serde(default)]
+    business: crate::business::BusinessBackup,
 }
 #[derive(Debug, Serialize)]
 pub struct BackupPreview {
@@ -162,7 +170,7 @@ pub struct BackupPreview {
 }
 
 pub struct LedgerStore {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 impl LedgerStore {
     pub fn open(path: &Path) -> Result<Self> {
@@ -182,7 +190,7 @@ impl LedgerStore {
         if app_id != 0 && app_id != 1330399058 {
             return Err(invalid("This file belongs to a different application."));
         }
-        if version > 1 {
+        if version > 2 {
             return Err(invalid(
                 "This database needs a newer version of Open Ledger.",
             ));
@@ -195,6 +203,9 @@ impl LedgerStore {
             conn.execute_batch(include_str!("schema.sql"))?;
         } else if app_id != 1330399058 {
             return Err(invalid("The database identity is missing."));
+        }
+        if version < 2 {
+            conn.execute_batch(include_str!("migration_v2.sql"))?;
         }
         if wal {
             conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -219,7 +230,7 @@ impl LedgerStore {
             )
             .optional()?)
     }
-    fn require_company(&self) -> Result<Company> {
+    pub(crate) fn require_company(&self) -> Result<Company> {
         self.company()?
             .ok_or_else(|| invalid("Create your company before adding accounts or journals."))
     }
@@ -322,11 +333,14 @@ impl LedgerStore {
                 "This request already posted a different journal. Start a new entry.",
             ));
         }
+        crate::business::check_stock_accounts(&tx, &posting)?;
         let id = insert_journal(&tx, &posting, None, None, &now())?;
         tx.commit()?;
         Ok(id)
     }
     pub fn reverse(&mut self, id: i64, date: &str, reason: &str, request_id: &str) -> Result<i64> {
+        self.check_business_reversal(id)?;
+        self.check_business_reversal_date(id, date)?;
         let original = self.journal(id)?;
         validate_date(date)?;
         if date < original.date.as_str() {
@@ -382,7 +396,7 @@ impl LedgerStore {
     }
     pub fn journal(&self, id: i64) -> Result<Journal> {
         let mut journal=self.conn.query_row("SELECT j.id,j.date,j.reference,j.description,j.created_at,j.total_minor,j.reversal_of,(SELECT id FROM journals r WHERE r.reversal_of=j.id AND r.status='posted') FROM journals j WHERE j.id=?1 AND j.status='posted'",[id],|r|Ok(Journal{id:r.get(0)?,date:r.get(1)?,reference:r.get(2)?,description:r.get(3)?,created_at:r.get(4)?,total_minor:r.get::<_,i64>(5)?.to_string(),reversal_of:r.get(6)?,reversed_by:r.get(7)?,lines:vec![]})).optional()?.ok_or_else(||invalid("Journal entry not found."))?;
-        let mut q=self.conn.prepare("SELECT l.account_id,a.code,a.name,l.side,l.amount_minor FROM lines l JOIN accounts a ON a.id=l.account_id WHERE l.journal_id=?1 ORDER BY l.position")?;
+        let mut q=self.conn.prepare("SELECT l.account_id,a.code,a.name,l.side,l.amount_minor,l.id FROM lines l JOIN accounts a ON a.id=l.account_id WHERE l.journal_id=?1 ORDER BY l.position")?;
         let raw = q
             .query_map([id], |r| {
                 Ok((
@@ -391,24 +405,33 @@ impl LedgerStore {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         journal.lines = raw
             .into_iter()
-            .map(|(account_id, account_code, account_name, side, amount)| {
-                Ok(JournalLine {
-                    account_id,
-                    account_code,
-                    account_name,
-                    side: Side::parse(&side)?,
-                    amount_minor: amount.to_string(),
-                })
-            })
+            .map(
+                |(account_id, account_code, account_name, side, amount, id)| {
+                    Ok(JournalLine {
+                        id,
+                        account_id,
+                        account_code,
+                        account_name,
+                        side: Side::parse(&side)?,
+                        amount_minor: amount.to_string(),
+                    })
+                },
+            )
             .collect::<Result<_>>()?;
         Ok(journal)
     }
     pub fn snapshot(&self) -> Result<Snapshot> {
+        let _read = if self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
         let company = self.company()?;
         let accounts = self.accounts()?;
         let mut q = self.conn.prepare(
@@ -439,9 +462,15 @@ impl LedgerStore {
             journal_count,
             journal_activity,
             trial_balance: self.trial_balance(None)?,
+            statements: self.financial_statements(None, None)?,
         })
     }
     pub fn trial_balance(&self, as_of: Option<&str>) -> Result<TrialBalance> {
+        let _read = if self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
         if let Some(date) = as_of {
             validate_date(date)?;
         }
@@ -489,6 +518,11 @@ impl LedgerStore {
         })
     }
     pub fn ledger(&self, account_id: i64, from: Option<&str>, to: Option<&str>) -> Result<Ledger> {
+        let _read = if self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
         if let Some(d) = from {
             validate_date(d)?;
         }
@@ -552,12 +586,18 @@ impl LedgerStore {
         })
     }
     pub fn export_backup(&self) -> Result<String> {
+        let _read = if self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
         let company = self.require_company()?;
         let accounts = self.accounts()?;
-        let mut q=self.conn.prepare("SELECT id,date,reference,description,request_id,created_at,reversal_of FROM journals WHERE status='posted' ORDER BY id")?;
+        let mut q=self.conn.prepare("SELECT id,date,reference,description,request_id,created_at,reversal_of,source FROM journals WHERE status='posted' ORDER BY id")?;
         let mut journals = q
             .query_map([], |r| {
                 Ok(BackupJournal {
+                    source: r.get(7)?,
                     id: r.get(0)?,
                     date: r.get(1)?,
                     reference: r.get(2)?,
@@ -581,6 +621,7 @@ impl LedgerStore {
                 .lines
                 .into_iter()
                 .map(|l| BackupLine {
+                    id: Some(l.id),
                     account_id: l.account_id,
                     side: l.side,
                     amount_minor: l.amount_minor,
@@ -589,20 +630,30 @@ impl LedgerStore {
         }
         Ok(serde_json::to_string_pretty(&Backup {
             format: "open-ledger-backup".into(),
-            version: 1,
+            version: 2,
             exported_at: now(),
             company,
             accounts,
             journals,
+            business: self.business_backup()?,
         })?)
     }
     pub fn prepare_restore(text: &str) -> Result<(Self, BackupPreview)> {
         if text.len() > 20 * 1024 * 1024 {
             return Err(invalid("This milestone supports backups up to 20 MB."));
         }
-        let mut backup: Backup = serde_json::from_str(text)?;
-        if backup.format != "open-ledger-backup" || backup.version != 1 {
+        let raw: serde_json::Value = serde_json::from_str(text)?;
+        if raw.get("version").and_then(|v| v.as_u64()) == Some(2) && raw.get("business").is_none() {
+            return Err(invalid("Version 2 backups require business records."));
+        }
+        let mut backup: Backup = serde_json::from_value(raw)?;
+        if backup.format != "open-ledger-backup" || !(1..=2).contains(&backup.version) {
             return Err(invalid("This is not a supported Open Ledger backup."));
+        }
+        if backup.version == 1 && !backup.business.is_empty() {
+            return Err(invalid(
+                "Version 1 backups cannot contain business records.",
+            ));
         }
         chrono::DateTime::parse_from_rfc3339(&backup.exported_at)
             .map_err(|_| invalid("The backup date is invalid."))?;
@@ -641,6 +692,10 @@ impl LedgerStore {
             }
             chrono::DateTime::parse_from_rfc3339(&journal.created_at)
                 .map_err(|_| invalid("A journal timestamp is invalid."))?;
+            let line_ids = journal.lines.iter().map(|l| l.id).collect::<Vec<_>>();
+            if line_ids.iter().flatten().any(|id| *id <= 0) {
+                return Err(invalid("Invalid posting line identifier."));
+            }
             let lines = journal
                 .lines
                 .into_iter()
@@ -703,16 +758,19 @@ impl LedgerStore {
                     return Err(invalid("The backup contains a reversal of a reversal."));
                 }
             }
-            insert_journal(
+            insert_journal_with_ids(
                 &tx,
                 &validated,
                 Some(journal.id),
                 journal.reversal_of,
                 &journal.created_at,
+                &line_ids,
+                &journal.source,
             )?;
             prior.insert(journal.id, validated);
         }
         tx.commit()?;
+        stage.restore_business(backup.business)?;
         if !stage.trial_balance(None)?.balanced {
             return Err(invalid("The restored trial balance does not balance."));
         }
@@ -744,13 +802,27 @@ fn insert_company(tx: &Transaction<'_>, c: &Company) -> Result<()> {
     )?;
     Ok(())
 }
-fn insert_journal(
+pub(crate) fn insert_journal(
     tx: &Transaction<'_>,
     p: &ValidatedJournal,
     id: Option<i64>,
     reversal_of: Option<i64>,
     created: &str,
 ) -> Result<i64> {
+    insert_journal_with_ids(tx, p, id, reversal_of, created, &[], "manual")
+}
+fn insert_journal_with_ids(
+    tx: &Transaction<'_>,
+    p: &ValidatedJournal,
+    id: Option<i64>,
+    reversal_of: Option<i64>,
+    created: &str,
+    line_ids: &[Option<i64>],
+    source: &str,
+) -> Result<i64> {
+    if !["manual", "document", "close"].contains(&source) {
+        return Err(invalid("Unknown journal source."));
+    }
     for line in &p.lines {
         let found: i64 = tx.query_row(
             "SELECT COUNT(*) FROM accounts WHERE id=?1",
@@ -762,7 +834,7 @@ fn insert_journal(
         }
     }
     let payload = serde_json::to_string(p)?;
-    tx.execute("INSERT INTO journals(id,date,reference,description,request_id,request_payload,created_at,total_minor,reversal_of) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id,p.date,p.reference,p.description,p.request_id,payload,created,p.total_minor,reversal_of])?;
+    tx.execute("INSERT INTO journals(id,date,reference,description,request_id,request_payload,created_at,total_minor,reversal_of,source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![id,p.date,p.reference,p.description,p.request_id,payload,created,p.total_minor,reversal_of,source])?;
     let id = tx.last_insert_rowid();
     if p.reference.is_empty() {
         tx.execute(
@@ -771,10 +843,21 @@ fn insert_journal(
         )?;
     }
     for (position, line) in p.lines.iter().enumerate() {
-        tx.execute("INSERT INTO lines(journal_id,position,account_id,side,amount_minor) VALUES(?1,?2,?3,?4,?5)",params![id,position as i64,line.account_id,line.side.as_str(),line.amount_minor])?;
+        tx.execute("INSERT INTO lines(id,journal_id,position,account_id,side,amount_minor) VALUES(?1,?2,?3,?4,?5,?6)",params![line_ids.get(position).copied().flatten(),id,position as i64,line.account_id,line.side.as_str(),line.amount_minor])?;
     }
     tx.execute("UPDATE journals SET status='posted' WHERE id=?1", [id])?;
     Ok(id)
+}
+
+fn manual_source() -> String {
+    "manual".into()
+}
+pub(crate) fn insert_business_journal(
+    tx: &Transaction<'_>,
+    p: &ValidatedJournal,
+    source: &str,
+) -> Result<i64> {
+    insert_journal_with_ids(tx, p, None, None, &now(), &[], source)
 }
 
 #[cfg(test)]

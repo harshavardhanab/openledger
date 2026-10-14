@@ -1,32 +1,46 @@
 # Roadmap
 
-## Current foundation
+Implementation status on branch `codex/roadmap-completion`. Open Ledger remains a prerelease; unchecked release gates are not implied complete by implemented features.
 
-Company and accounts, balanced journals, reversals, ledger and trial balance reports, backup/restore, and a local desktop interface.
+## Current foundation — implemented
 
-## Next functional milestone
+- [x] Company and accounts, exact balanced journals, immutable postings, linked reversals.
+- [x] Ledgers with opening/running balances, trial balance, backups and restore with recovery copies.
 
-- Sales and purchase invoices with customers and suppliers.
-- Payments and receipts linked to invoices, due dates, and outstanding balances.
-- Configurable numbering and document export.
-- Consistent vouchers and account mappings, validated against worked examples.
+## Functional milestone — implemented
+
+- [x] Sales and purchase invoices with customers and suppliers.
+- [x] Linked partial/full payments and receipts, due dates, as-of outstanding balances and overdue display.
+- [x] Configurable numbering, device-local drafts, reviewed posting, HTML export and print-to-PDF.
+- [x] Consistent vouchers and account mappings, validated against worked examples.
+
+See [accounting workflows](docs/ACCOUNTING.md) for posting rules and correction limitations.
 
 ## Further accounting work
 
-- Bank reconciliation, full balance sheet and profit/loss reports.
-- Financial periods, opening balances, closing and carry-forward workflows.
-- Inventory, stock movement, valuation, and unit handling.
-- Jurisdiction-specific taxes and reporting after separate specification and verification.
-- Documented import/export formats, including a separately designed Tally data importer.
+- [x] Bank reconciliation and immutable statement history; profit/loss and balance sheet reports.
+- [x] Consecutive financial periods, opening-balance journal workflow, closing to equity and automatic balance carry-forward.
+- [x] Inventory items, fractional units, movement audit, perpetual weighted average valuation and adjustments.
+- [ ] Inventory invoice credit/debit notes and cancellation with linked stock returns. Separate journal reversal is deliberately rejected for stock documents. Tracked in [#5](https://github.com/harshavardhanab/openledger/issues/5).
+- [ ] Jurisdiction-specific taxes and reporting after separate specification and verification. Country/regime and expected worked examples are required. Tracked in [#3](https://github.com/harshavardhanab/openledger/issues/3).
+- [x] Documented native import/export formats and atomic journal-import preview/commit.
+- [x] Separately designed Tally adapter requirements in [import/export contracts](docs/IMPORT_EXPORT.md).
+- [ ] Implement and verify that Tally adapter against anonymized exports from explicitly supported versions/dialects. No export fixture was supplied. Tracked in [#4](https://github.com/harshavardhanab/openledger/issues/4).
 
 ## Before a stable release
 
-- Exercise clean builds and packaged applications on macOS, Windows, and Linux.
-- Automated end-to-end desktop tests for posting, report filtering, backup, restore, and recovery failures.
-- Backup compatibility and schema migration tests, interrupted-write testing, and recovery drills.
-- Accessibility and keyboard testing; large-book performance and pagination.
-- A clear company/demo switching workflow and locale-aware presentation.
-- Independent accounting review and security review.
-- Signed release packages, macOS notarization, and a secure update policy.
+- [ ] Exercise clean builds and installed packages on macOS, Windows, and Linux for the final candidate. Build/package workflows are provided; exact-run results belong in VALIDATION.md.
+- [x] Automated browser end-to-end workflows for posting, reports, invoices, reversal, backup/restore and malformed restore rejection in Chromium and WebKit.
+- [ ] Native Windows/Linux WebDriver smoke tests pass in CI; macOS native manual checklist completed for the final candidate.
+- [x] Backup compatibility and transactional schema migration tests, interrupted-write recovery and recovery-backup drills.
+- [x] Keyboard basics, focus trapping, locale-aware presentation and journal/document/ledger/stock pagination.
+- [x] Large-book regression at 2,000 invoices with complete report totals. Broader capacity profiling remains necessary before raising documented limits.
+- [ ] Independent screen reader, zoom/high-contrast, and full keyboard accessibility audit.
+- [x] Separate company/example databases and persistent company switching.
+- [ ] Independent accounting review and independent security review, with named reviewers, exact commit and resolved findings.
+- [x] Trusted-candidate signing/notarization workflow and a manual signed-update policy.
+- [ ] Production signing credentials, protected release environment, published verification key, successful OS signature/notarization checks, and approved stable artifacts.
 
-No dates or feature guarantees are assigned yet. Track scoped implementation work in GitHub issues.
+Remaining external release gates are tracked in [#6](https://github.com/harshavardhanab/openledger/issues/6).
+
+See [release policy](docs/RELEASE.md) for required credentials, reviews and platform checks. No dates or feature guarantees are assigned. Remaining work must be tracked as scoped GitHub issues. Payroll, multi-user operation, mobile applications, unit conversions and alternate stock valuations are outside this roadmap's current implementation scope.

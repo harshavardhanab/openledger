@@ -1708,3 +1708,111 @@ select:focus {
     transition: none !important;
   }
 }
+.business-stack {
+  display: grid;
+  gap: 22px;
+}
+.business-card {
+  padding: 24px;
+}
+.business-card > h3 {
+  margin-bottom: 18px;
+}
+.business-card > p {
+  margin: 12px 0;
+  line-height: 1.8;
+}
+.business-card .panel-title {
+  padding: 0 0 18px;
+}
+.business-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+}
+.business-grid label {
+  margin-bottom: 6px;
+}
+.business-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  margin-top: 18px;
+}
+.document-line {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px;
+  margin: 20px 0;
+}
+.document-line legend {
+  color: var(--green);
+  padding: 0 6px;
+}
+.numbering-form {
+  display: grid;
+  grid-template-columns: 150px 1fr 1fr auto;
+  gap: 16px;
+  align-items: center;
+  margin-top: 18px;
+}
+.numbering-form label {
+  margin: 0;
+}
+textarea {
+  font: inherit;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  resize: vertical;
+  color: var(--ink);
+}
+textarea:focus-visible {
+  outline: 2px solid #82a64b;
+  outline-offset: 3px;
+}
+input[type='checkbox'] {
+  min-height: 16px;
+  width: 16px;
+  accent-color: var(--green);
+}
+.sidebar {
+  overflow-y: auto;
+}
+.sidebar nav {
+  gap: 3px;
+}
+.sidebar nav button {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+.print-frame {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  bottom: 0;
+  border: 0;
+}
+@media (max-width: 650px) {
+  .numbering-form {
+    grid-template-columns: 1fr 1fr;
+  }
+  .business-card {
+    padding: 16px;
+  }
+}
+.business-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.business-field label {
+  margin-bottom: 0;
+}
+.business-field input,
+.business-field select,
+.business-field textarea {
+  width: 100%;
+}

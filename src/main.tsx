@@ -1,3 +1,4 @@
+import { BusinessWorkspace, BusinessPage } from './business';
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
@@ -22,7 +23,7 @@ import {
 } from './api';
 import './styles.css';
 
-type Page = 'overview' | 'journals' | 'accounts' | 'ledger' | 'trial' | 'backups';
+type Page = BusinessPage | 'overview' | 'journals' | 'accounts' | 'ledger' | 'trial' | 'backups';
 type Modal = 'journal' | 'account' | { reverse: Journal } | null;
 const kinds: Kind[] = ['asset', 'liability', 'equity', 'income', 'expense'];
 const ErrorContext = createContext('');
@@ -176,7 +177,7 @@ function ModalFrame({
       if (e.key === 'Tab') {
         const items = Array.from(
           ref.current?.querySelectorAll<HTMLElement>(
-            'button:not(:disabled),input:not(:disabled),select:not(:disabled)',
+            'button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled)',
           ) || [],
         );
         if (!items.length) return;
@@ -243,6 +244,9 @@ function App() {
   };
   useEffect(() => {
     void reload();
+    const onExportError = (event: Event) => setError(String((event as CustomEvent).detail));
+    window.addEventListener('open-ledger-error', onExportError);
+    return () => window.removeEventListener('open-ledger-error', onExportError);
   }, []);
   useEffect(() => {
     if (!toast) return;
@@ -265,6 +269,12 @@ function App() {
     try {
       await request(command, payload);
       await reload();
+      if (['new_books', 'switch_books'].includes(command)) {
+        setSelectedAccount(0);
+        setSelectedJournal(null);
+        setModal(null);
+        setPage('overview');
+      }
       setToast(message);
       return true;
     } catch (e) {
@@ -317,6 +327,11 @@ function App() {
     accounts: ['Chart of accounts', 'The structure behind your financial records.'],
     ledger: ['Account ledger', 'Follow the movement in an individual account.'],
     trial: ['Trial balance', 'Closing balances across every account.'],
+    documents: ['Invoices & settlements', 'Customers, suppliers, and outstanding invoices.'],
+    inventory: ['Inventory', 'Stock movements and carrying values.'],
+    statements: ['Financial statements', 'Profit and loss and balance sheet.'],
+    reconciliation: ['Bank reconciliation', 'Match your books to bank statements.'],
+    settings: ['Company & periods', 'Company switching, numbering, closing, and import.'],
     backups: ['Backups & restore', 'Keep a recoverable copy of your books.'],
   };
   return (
@@ -333,30 +348,47 @@ function App() {
           </div>
           <p className="nav-label">WORKSPACE</p>
           <nav>
-            {(['overview', 'journals', 'accounts', 'ledger', 'trial', 'backups'] as Page[]).map(
-              (item) => (
-                <button
-                  key={item}
-                  className={page === item ? 'active' : ''}
-                  onClick={() => navigate(item)}
-                >
-                  <Icon name={item} />
-                  <span>
+            {(
+              [
+                'overview',
+                'documents',
+                'inventory',
+                'journals',
+                'accounts',
+                'ledger',
+                'trial',
+                'statements',
+                'reconciliation',
+                'settings',
+                'backups',
+              ] as Page[]
+            ).map((item) => (
+              <button
+                key={item}
+                className={page === item ? 'active' : ''}
+                onClick={() => navigate(item)}
+              >
+                <Icon name={item} />
+                <span>
+                  {
                     {
-                      {
-                        overview: 'Overview',
-                        journals: 'Journal entries',
-                        accounts: 'Chart of accounts',
-                        ledger: 'Account ledger',
-                        trial: 'Trial balance',
-                        backups: 'Backups',
-                      }[item]
-                    }
-                  </span>
-                  {item === 'journals' && <small>{state.journal_count}</small>}
-                </button>
-              ),
-            )}
+                      overview: 'Overview',
+                      journals: 'Journal entries',
+                      accounts: 'Chart of accounts',
+                      ledger: 'Account ledger',
+                      trial: 'Trial balance',
+                      documents: 'Invoices & settlements',
+                      inventory: 'Inventory',
+                      statements: 'Financial statements',
+                      reconciliation: 'Bank reconciliation',
+                      settings: 'Company & periods',
+                      backups: 'Backups',
+                    }[item]
+                  }
+                </span>
+                {item === 'journals' && <small>{state.journal_count}</small>}
+              </button>
+            ))}
           </nav>
           <div className="sidebar-bottom">
             <div className="local-status">
@@ -400,7 +432,7 @@ function App() {
                     Add account
                   </button>
                 ) : (
-                  page !== 'backups' && (
+                  ['overview', 'journals', 'ledger', 'trial'].includes(page) && (
                     <button className="button primary" onClick={() => setModal('journal')}>
                       <Icon name="plus" size={17} />
                       New journal<span className="shortcut">⌘ J</span>
@@ -420,6 +452,19 @@ function App() {
                   <Icon name="close" size={16} />
                 </button>
               </div>
+            )}
+            {(
+              ['documents', 'inventory', 'statements', 'reconciliation', 'settings'] as Page[]
+            ).includes(page) && (
+              <BusinessWorkspace
+                key={`${page}-${state.company.created_at}`}
+                page={page as BusinessPage}
+                state={state}
+                busy={busy}
+                mutate={mutate}
+                onError={setError}
+                openJournal={setSelectedJournal}
+              />
             )}
             {page === 'overview' && (
               <Overview
@@ -538,6 +583,12 @@ function Welcome({ busy, error, mutate }: { busy: boolean; error: string; mutate
   const [name, setName] = useState('');
   const [currency, setCurrency] = useState('INR');
   const [start, setStart] = useState(`${today().slice(0, 4)}-01-01`);
+  const [books, setBooks] = useState<{ file: string; company: Snapshot['company'] }[]>([]);
+  useEffect(() => {
+    void request<{ books: typeof books }>('books')
+      .then((v) => setBooks(v.books))
+      .catch(() => {});
+  }, []);
   return (
     <div className="welcome">
       <div className="welcome-story">
@@ -645,10 +696,34 @@ function Welcome({ busy, error, mutate }: { busy: boolean; error: string; mutate
           <button
             className="button secondary full"
             disabled={busy}
-            onClick={() => void mutate('create_demo', {}, 'Example books are ready.')}
+            onClick={async () => {
+              if (await mutate('new_books', {}, 'Example file created.'))
+                await mutate('create_demo', {}, 'Example books are ready.');
+            }}
           >
             Try example books
           </button>
+          {books.some((b) => b.company) && (
+            <label>
+              Open existing company
+              <select
+                value=""
+                disabled={busy}
+                onChange={(e) =>
+                  void mutate('switch_books', { file: e.target.value }, 'Company opened.')
+                }
+              >
+                <option value="">Select company</option>
+                {books
+                  .filter((b) => b.company)
+                  .map((b) => (
+                    <option key={b.file} value={b.file}>
+                      {b.company!.name}
+                    </option>
+                  ))}
+              </select>
+            </label>
+          )}
           <p className="setup-note">
             <Icon name="shield" size={16} />
             Books are saved locally. No account or internet connection is required in the desktop
@@ -679,8 +754,8 @@ function Overview({
         .reduce((sum, row) => sum + BigInt(row.net_debit_minor), 0n),
     ]),
   ) as Record<Kind, bigint>;
-  const income = -values.income;
-  const expenses = values.expense;
+  const income = BigInt(state.statements.income_minor);
+  const expenses = BigInt(state.statements.expense_minor);
   const profit = income - expenses;
   const metrics: [string, bigint, string, string][] = [
     ['Total assets', values.asset, 'accounts', 'Cash, receivables & other assets'],
@@ -878,7 +953,26 @@ function Journals({
   newJournal: () => void;
 }) {
   const [search, setSearch] = useState('');
-  const records = state.journals.filter((j) =>
+  const [offset, setOffset] = useState(0);
+  const [journals, setJournals] = useState<Journal[]>(state.journals.slice(0, 50));
+  const [loadError, setLoadError] = useState('');
+  useEffect(() => {
+    let live = true;
+    void request<Journal[]>('journals_page', { offset, limit: 50 })
+      .then((v) => {
+        if (live) {
+          setJournals(v);
+          setLoadError('');
+        }
+      })
+      .catch((e) => {
+        if (live) setLoadError(String(e.message || e));
+      });
+    return () => {
+      live = false;
+    };
+  }, [offset, state]);
+  const records = journals.filter((j) =>
     `${j.reference} ${j.description} ${j.date}`.toLowerCase().includes(search.toLowerCase()),
   );
   return (
@@ -887,8 +981,8 @@ function Journals({
         <div className="search-input">
           <Icon name="search" size={18} />
           <input
-            aria-label="Search journal entries"
-            placeholder="Search references or descriptions…"
+            aria-label="Search journal entries on this page"
+            placeholder="Search this page…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
           />
@@ -897,6 +991,11 @@ function Journals({
           {records.length} shown · {state.journal_count} total
         </span>
       </div>
+      {loadError && (
+        <p role="alert" className="form-error">
+          {loadError}
+        </p>
+      )}
       {records.length ? (
         <JournalTable journals={records} currency={state.company!.currency} open={open} />
       ) : (
@@ -915,6 +1014,23 @@ function Journals({
             : 'Post a balanced entry to begin building your books.'}
         </Empty>
       )}
+      <div className="panel-toolbar">
+        <button
+          className="button secondary"
+          disabled={!offset}
+          onClick={() => setOffset(Math.max(0, offset - 50))}
+        >
+          Previous
+        </button>
+        <span>Page {offset / 50 + 1}</span>
+        <button
+          className="button secondary"
+          disabled={offset + 50 >= state.journal_count}
+          onClick={() => setOffset(offset + 50)}
+        >
+          Next
+        </button>
+      </div>
     </section>
   );
 }
@@ -1027,11 +1143,19 @@ function LedgerView({
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [data, setData] = useState<Ledger | null>(null);
+  const [offset, setOffset] = useState(0);
+  useEffect(() => setOffset(0), [account, from, to]);
   const [loading, setLoading] = useState(false);
   useEffect(() => {
     let active = true;
     setLoading(true);
-    request<Ledger>('ledger', { account_id: account, from: from || null, to: to || null })
+    request<Ledger>('ledger_page', {
+      account_id: account,
+      from: from || null,
+      to: to || null,
+      offset,
+      limit: 50,
+    })
       .then((v) => {
         if (active) setData(v);
       })
@@ -1047,7 +1171,7 @@ function LedgerView({
     return () => {
       active = false;
     };
-  }, [account, from, to, state.journal_count]);
+  }, [account, from, to, state.journal_count, offset]);
   const currency = state.company!.currency;
   return (
     <>
@@ -1073,10 +1197,15 @@ function LedgerView({
         <button
           className="button secondary"
           disabled={!data || loading}
-          onClick={() => {
-            if (data)
+          onClick={async () => {
+            try {
+              const all = await request<Ledger>('ledger', {
+                account_id: account,
+                from: from || null,
+                to: to || null,
+              });
               download(
-                `ledger-${data.account.code}.csv`,
+                `ledger-${all.account.code}.csv`,
                 csv([
                   [
                     'Date',
@@ -1086,7 +1215,7 @@ function LedgerView({
                     `Credit (${currency})`,
                     'Running debit balance',
                   ],
-                  ...data.lines.map((l) => [
+                  ...all.lines.map((l) => [
                     l.date,
                     l.reference,
                     l.description,
@@ -1097,6 +1226,9 @@ function LedgerView({
                 ]),
                 'text/csv',
               );
+            } catch (e) {
+              onError(String(e instanceof Error ? e.message : e));
+            }
           }}
         >
           <Icon name="download" size={16} />
@@ -1131,7 +1263,7 @@ function LedgerView({
                   {data.account.code} · {kindName[data.account.kind]}
                 </p>
               </div>
-              <Badge neutral>{data.lines.length} postings</Badge>
+              <Badge neutral>{data.line_count || 0} postings</Badge>
             </div>
             {data.lines.length ? (
               <div className="table-scroll">
@@ -1172,6 +1304,23 @@ function LedgerView({
                 Choose another account or adjust the date range.
               </Empty>
             )}
+            <div className="panel-toolbar">
+              <button
+                className="button secondary"
+                disabled={!offset}
+                onClick={() => setOffset(Math.max(0, offset - 50))}
+              >
+                Previous
+              </button>
+              <span>Page {offset / 50 + 1}</span>
+              <button
+                className="button secondary"
+                disabled={offset + 50 >= (data.line_count || 0)}
+                onClick={() => setOffset(offset + 50)}
+              >
+                Next
+              </button>
+            </div>
           </section>
         </>
       )}

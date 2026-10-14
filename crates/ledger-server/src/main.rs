@@ -44,6 +44,22 @@ async fn request(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let allowed_hosts = [
+        format!("127.0.0.1:{}", state.port),
+        format!("localhost:{}", state.port),
+        "127.0.0.1:1420".into(),
+        "localhost:1420".into(),
+    ];
+    if !headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| allowed_hosts.iter().any(|h| h == s))
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"This host is not allowed."})),
+        ));
+    }
     if let Some(origin) = headers.get("origin") {
         let origin = origin.to_str().unwrap_or("");
         if ![

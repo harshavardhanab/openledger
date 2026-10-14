@@ -10,13 +10,16 @@
     "desktop:build": "tauri build",
     "test": "cargo test --workspace --exclude open-ledger-desktop --locked",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "test:e2e": "npm run build && cargo build -p ledger-server --locked && playwright test",
+    "test:desktop": "node scripts/desktop-smoke.mjs"
   },
   "dependencies": {
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.1",
     "@tauri-apps/cli": "^2.9.0",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",

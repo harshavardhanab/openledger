@@ -12,11 +12,31 @@ use uuid::Uuid;
 pub struct LedgerService {
     store: Mutex<LedgerStore>,
     recovery_dir: PathBuf,
+    default_path: PathBuf,
+    active_path: PathBuf,
 }
 impl LedgerService {
     pub fn open(path: &Path) -> crate::Result<Self> {
+        let active_path = path.with_extension("active");
+        let selected = if active_path.exists() {
+            let name = std::fs::read_to_string(&active_path)?;
+            if !valid_book_name(&name) {
+                return Err(StoreError::Conflict("Invalid active books file.".into()));
+            }
+            let selected = path.parent().unwrap_or(Path::new(".")).join(name);
+            if !selected.exists() {
+                return Err(StoreError::Conflict(
+                    "The active books file is missing. Recover the file before continuing.".into(),
+                ));
+            }
+            selected
+        } else {
+            path.to_path_buf()
+        };
         Ok(Self {
-            store: Mutex::new(LedgerStore::open(path)?),
+            store: Mutex::new(LedgerStore::open(&selected)?),
+            default_path: path.to_path_buf(),
+            active_path,
             recovery_dir: path
                 .parent()
                 .unwrap_or(Path::new("."))
@@ -33,6 +53,151 @@ impl LedgerService {
             )
         })?;
         Ok(match command {
+            "books" => {
+                let parent = self.default_path.parent().unwrap_or(Path::new("."));
+                let mut books = vec![];
+                for entry in std::fs::read_dir(parent)? {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if valid_book_name(&name) || entry.path() == self.default_path {
+                        let book = LedgerStore::open(&entry.path())?;
+                        books.push(json!({"file":name,"company":book.company()?}));
+                    }
+                }
+                json!({"books":books,"active":std::fs::read_to_string(&self.active_path).unwrap_or_else(|_|self.default_path.file_name().unwrap().to_string_lossy().into_owned())})
+            }
+            "new_books" => {
+                let name = format!("books-{}.sqlite", Uuid::new_v4());
+                let mut next = LedgerStore::open(
+                    &self
+                        .default_path
+                        .parent()
+                        .unwrap_or(Path::new("."))
+                        .join(&name),
+                )?;
+                if !payload.is_null() && payload.get("name").is_some() {
+                    next.create_company(serde_json::from_value::<CompanyInput>(payload)?)?;
+                }
+                write_atomic(&self.active_path, &name)?;
+                *store = next;
+                serde_json::to_value(store.snapshot()?)?
+            }
+            "switch_books" => {
+                let input: BookSelection = serde_json::from_value(payload)?;
+                let default = self.default_path.file_name().unwrap().to_string_lossy();
+                if !valid_book_name(&input.file) && input.file != default {
+                    return Err(StoreError::Conflict("Unknown books file.".into()));
+                }
+                let path = self
+                    .default_path
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join(&input.file);
+                if !path.exists() {
+                    return Err(StoreError::Conflict("Books file not found.".into()));
+                }
+                let next = LedgerStore::open(&path)?;
+                if input.file == default {
+                    if self.active_path.exists() {
+                        std::fs::remove_file(&self.active_path)?;
+                    }
+                } else {
+                    write_atomic(&self.active_path, &input.file)?;
+                }
+                *store = next;
+                serde_json::to_value(store.snapshot()?)?
+            }
+            "business" => {
+                let input: BusinessQuery = serde_json::from_value(payload)?;
+                serde_json::to_value(store.business_state(
+                    input.offset.unwrap_or(0),
+                    input.limit.unwrap_or(50),
+                    input.as_of.as_deref(),
+                )?)?
+            }
+            "create_party" => {
+                serde_json::to_value(store.create_party(serde_json::from_value(payload)?)?)?
+            }
+            "create_item" => {
+                serde_json::to_value(store.create_item(serde_json::from_value(payload)?)?)?
+            }
+            "post_document" => {
+                serde_json::to_value(store.post_document(serde_json::from_value(payload)?)?)?
+            }
+            "set_numbering" => {
+                store.set_numbering(serde_json::from_value(payload)?)?;
+                json!({"saved":true})
+            }
+            "financial_statements" => {
+                let input: DateRange = serde_json::from_value(payload)?;
+                serde_json::to_value(
+                    store.financial_statements(input.from.as_deref(), input.as_of.as_deref())?,
+                )?
+            }
+            "close_period" => {
+                let input: CloseInput = serde_json::from_value(payload)?;
+                serde_json::to_value(store.close_period(
+                    &input.start,
+                    &input.end,
+                    input.equity_account_id,
+                )?)?
+            }
+            "bank_lines" => {
+                let input: BankQuery = serde_json::from_value(payload)?;
+                serde_json::to_value(store.bank_lines(input.account_id, input.as_of.as_deref())?)?
+            }
+            "reconcile" => {
+                serde_json::to_value(store.reconcile(serde_json::from_value(payload)?)?)?
+            }
+            "stock_history" => {
+                let input: PageQuery = serde_json::from_value(payload)?;
+                store.stock_history(input.offset, input.limit)?
+            }
+            "ledger_page" => {
+                let input: LedgerPageInput = serde_json::from_value(payload)?;
+                if input.offset < 0 || !(1..=200).contains(&input.limit) {
+                    return Err(StoreError::Conflict("Invalid page.".into()));
+                }
+                let mut ledger =
+                    store.ledger(input.account_id, input.from.as_deref(), input.to.as_deref())?;
+                let count = ledger.lines.len();
+                ledger.lines = ledger
+                    .lines
+                    .into_iter()
+                    .skip(input.offset as usize)
+                    .take(input.limit as usize)
+                    .collect();
+                let mut value = serde_json::to_value(ledger)?;
+                value["line_count"] = json!(count);
+                value
+            }
+            "journals_page" => {
+                let input: PageQuery = serde_json::from_value(payload)?;
+                serde_json::to_value(store.journals_page(input.offset, input.limit)?)?
+            }
+            "import_journals" => {
+                let input: ImportInput = serde_json::from_value(payload)?;
+                if input.format != "open-ledger-journals"
+                    || input.version != 1
+                    || input.journals.len() > 10000
+                {
+                    return Err(StoreError::Conflict(
+                        "Unsupported import format or batch size.".into(),
+                    ));
+                }
+                let (mut stage, _) = LedgerStore::prepare_restore(&store.export_backup()?)?;
+                let mut ids = vec![];
+                for journal in input.journals {
+                    ids.push(stage.post(journal)?);
+                }
+                let tb = stage.trial_balance(None)?;
+                if input.preview {
+                    json!({"count":ids.len(),"trial_balance":tb})
+                } else {
+                    store.replace_with(&stage)?;
+                    json!({"count":ids.len(),"trial_balance":tb})
+                }
+            }
             "state" => serde_json::to_value(store.snapshot()?)?,
             "journal" => {
                 let input: JournalId = serde_json::from_value(payload)?;
@@ -139,6 +304,8 @@ pub fn write_atomic(path: &Path, contents: &str) -> crate::Result<()> {
     file.write_all(contents.as_bytes())?;
     file.as_file().sync_all()?;
     file.persist(path).map_err(|e| StoreError::Io(e.error))?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 #[derive(Deserialize)]
@@ -170,4 +337,65 @@ struct LedgerInput {
 #[serde(deny_unknown_fields)]
 struct RestoreInput {
     contents: String,
+}
+
+fn valid_book_name(name: &str) -> bool {
+    name.strip_prefix("books-")
+        .and_then(|s| s.strip_suffix(".sqlite"))
+        .is_some_and(|s| Uuid::parse_str(s).is_ok())
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BookSelection {
+    file: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BusinessQuery {
+    offset: Option<i64>,
+    limit: Option<i64>,
+    as_of: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DateRange {
+    from: Option<String>,
+    as_of: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloseInput {
+    start: String,
+    end: String,
+    equity_account_id: i64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BankQuery {
+    account_id: i64,
+    as_of: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PageQuery {
+    offset: i64,
+    limit: i64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportInput {
+    format: String,
+    version: u32,
+    journals: Vec<JournalInput>,
+    preview: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerPageInput {
+    account_id: i64,
+    from: Option<String>,
+    to: Option<String>,
+    offset: i64,
+    limit: i64,
 }

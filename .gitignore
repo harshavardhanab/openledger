@@ -13,3 +13,5 @@
 /artifacts/
 /recovery-backups/
 *.log
+/playwright-report/
+/test-results/

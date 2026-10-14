@@ -1,4 +1,22 @@
-# Validation — 14 October 2026
+# Roadmap implementation validation — 14 October 2026
+
+Branch: `codex/roadmap-completion`, based on main commit `ad949af`. Local platform: Apple Silicon macOS, Node.js 22.22.1, Rust 1.99.
+
+- Clean `npm ci` and locked Rust dependencies.
+- 28 Rust tests: existing journal/reversal/report checks plus sales/purchases, partial receipts/payments, settlement chronology, perpetual weighted average inventory, fractional-cost rounding, negative/backdated stock rejection, financial statements, period closing, reconciliation, document-number collision rollback, company switching, batch import, backup v1 compatibility, business-record tamper rejection, failed migration rollback, interrupted-process recovery, and 2,000-invoice paging with full report totals.
+- Eight browser tests pass in Chromium and WebKit. They exercise interface invoice posting and receipts, HTML export, journal posting/reversal, report filtering, backup/restore and malformed restore protection, pagination, locale preferences, keyboard shortcuts, and foreign-origin rejection.
+- Strict TypeScript/Vite build, Prettier, Rust formatting and Clippy with warnings denied pass.
+- npm audit reports zero known vulnerabilities at this check. This is not an independent security audit.
+- ARM64 macOS release application builds; ad hoc signature/native checks are recorded below when completed.
+- Cross-platform build, browser tests, Windows/Linux native WebDriver smoke tests and package workflows are configured. Their exact run conclusions must be verified remotely; configuration alone is not platform execution evidence.
+
+The free Tauri native driver lacks macOS WKWebView support. Browser WebKit testing is distinct from native desktop testing. Production signing secrets and release-signing environment protections were not configured at inspection time. No Developer ID notarization, Windows trusted-signature result, independent accounting/security review or full accessibility audit is claimed. See ROADMAP.md and docs/RELEASE.md for remaining gates.
+
+## Historical foundation evidence
+
+The following records describe the earlier foundation, not the current candidate.
+
+### Foundation validation — 14 October 2026
 
 Validated locally on Apple Silicon macOS with Rust 1.99 and Node.js 22.22.1.
 
@@ -13,7 +31,7 @@ Validated locally on Apple Silicon macOS with Rust 1.99 and Node.js 22.22.1.
 
 Windows and Linux compilation is configured in GitHub Actions but has not been executed. Mobile applications, public repository publication, installers for other systems, and notarization are outside this milestone.
 
-## Repository migration checks
+### Foundation repository migration checks
 
 The source now lives at the root of `~/work/openledger` on `feat/open-ledger-foundation`. All previous session artifacts and working files were moved into Git-ignored `.research/`; the original supplied installer was copied into the archive without changing the original. Compatibility symlinks preserve earlier artifact paths.
 
