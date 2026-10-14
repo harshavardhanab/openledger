@@ -122,3 +122,96 @@ test('loopback API rejects foreign origins', async ({ request }) => {
   });
   expect(response.status()).toBe(403);
 });
+
+test('inventory adjustment and stock sale calculate cost through the interface', async ({
+  page,
+  request,
+}) => {
+  await company(page, request, 'Inventory UI');
+  const asset = await api(request, 'create_account', {
+    code: '1300',
+    name: 'Inventory asset',
+    kind: 'asset',
+  });
+  const expense = await api(request, 'create_account', {
+    code: '5100',
+    name: 'Cost of sales',
+    kind: 'expense',
+  });
+  await api(request, 'create_item', {
+    code: 'WIDGET',
+    name: 'Widget',
+    unit: 'each',
+    asset_account_id: asset.id,
+    expense_account_id: expense.id,
+  });
+  await api(request, 'create_party', {
+    name: 'Buyer',
+    kind: 'customer',
+    contact: '',
+    account_id: 3,
+  });
+  await page.reload();
+  await nav(page, 'Inventory');
+  await page.getByRole('button', { name: 'Stock adjustment', exact: true }).click();
+  await page
+    .getByLabel('Inventory item', { exact: true })
+    .selectOption({ label: 'WIDGET · Widget (each)' });
+  await page.getByLabel('Quantity (up to 3 decimals)').fill('2');
+  await page.getByLabel('Unit price', { exact: true }).fill('10');
+  await page.getByLabel('Offset account').selectOption('6');
+  await page.getByRole('button', { name: 'Review document' }).click();
+  await page.getByRole('button', { name: 'Post stock adjustment', exact: true }).click();
+  await expect(page.getByRole('cell', { name: '20.00', exact: false }).first()).toBeVisible();
+  await nav(page, 'Invoices & settlements');
+  await page.getByRole('button', { name: 'New sales invoice' }).click();
+  await page.getByLabel('Customer', { exact: true }).selectOption({ label: 'Buyer' });
+  await page
+    .getByLabel('Inventory item', { exact: true })
+    .selectOption({ label: 'WIDGET · Widget (each)' });
+  await page.getByLabel('Unit price', { exact: true }).fill('15');
+  await page.getByLabel('Posting account').selectOption('7');
+  await page.getByRole('button', { name: 'Review document' }).click();
+  await page.getByRole('button', { name: 'Post sales invoice' }).click();
+  await expect(page.getByRole('button', { name: 'INV-000001', exact: true })).toBeVisible();
+  const report = await api(request, 'financial_statements');
+  expect(report.profit_minor).toBe('500');
+  const stock = await api(request, 'business');
+  expect(stock.stock[0].quantity_milli).toBe('1000');
+  expect(stock.stock[0].value_minor).toBe('1000');
+});
+test('bank reconciliation and empty-earnings period closing work through the interface', async ({
+  page,
+  request,
+}) => {
+  await company(page, request, 'Bank and closing UI');
+  await journal(request, 'bank-capital', '42');
+  await page.reload();
+  await nav(page, 'Bank reconciliation');
+  await page.getByLabel('Statement closing').fill('42');
+  await page.getByLabel('Statement reference').fill('Test statement');
+  await page.getByRole('checkbox', { name: /Clear bank-capital line/ }).check();
+  await page.getByRole('button', { name: 'Save reconciliation' }).click();
+  await expect(page.getByRole('cell', { name: 'Test statement', exact: true })).toBeVisible();
+  await nav(page, 'Company & periods');
+  await page.getByLabel('Period ends').fill('2026-10-14');
+  await page.getByLabel('Retained earnings / equity account').selectOption('6');
+  await page.getByRole('checkbox', { name: /I reviewed the period/ }).check();
+  await page.getByRole('button', { name: 'Close period', exact: true }).click();
+  await expect(
+    page.getByRole('cell', { name: 'No earnings to transfer', exact: true }),
+  ).toBeVisible();
+  const failed = await request.post('/api/post_journal', {
+    data: {
+      date: '2026-10-01',
+      reference: 'closed',
+      description: 'Blocked after close',
+      request_id: 'closed',
+      lines: [
+        { account_id: 2, side: 'debit', amount: '1' },
+        { account_id: 6, side: 'credit', amount: '1' },
+      ],
+    },
+  });
+  expect(failed.ok()).toBe(false);
+});
