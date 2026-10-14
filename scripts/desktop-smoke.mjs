@@ -65,6 +65,7 @@ try {
     }),
   );
   session = created.sessionId;
+  await send(`/session/${session}/timeouts`, 'POST', { pageLoad: 30000, script: 10000 });
   await poll(async () => {
     assert.equal(
       await script(
@@ -127,7 +128,11 @@ try {
 } catch (error) {
   if (session) {
     const diagnostics = await script(
-      'return {url:location.href,title:document.title,body:document.body?.innerText}',
+      `const probe = f => {try {return f()} catch(e) {return String(e)}};
+       return {url:location.href,title:document.title,html:document.documentElement.outerHTML,
+       storage:probe(()=>localStorage.getItem('open-ledger-locale')),
+       intl:probe(()=>new Intl.NumberFormat(navigator.language,{style:'currency',currency:'INR'}).formatToParts(0n)),
+       tauri:Boolean(window.__TAURI__?.core),resources:performance.getEntriesByType('resource').map(r=>({name:r.name,size:r.transferSize}))}`,
     ).catch((e) => ({ error: String(e) }));
     console.error('Native page diagnostics:', JSON.stringify(diagnostics));
     const screenshot = await send(`/session/${session}/screenshot`, 'GET').catch(() => null);

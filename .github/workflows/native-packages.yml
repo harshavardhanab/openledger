@@ -65,8 +65,10 @@ jobs:
           $installPath = "$env:RUNNER_TEMP/open-ledger-installed"
           $process = Start-Process -FilePath $installer -ArgumentList '/S',"/D=$installPath" -PassThru -Wait
           if ($process.ExitCode -ne 0) { throw 'Installer failed' }
-          $binary = Join-Path $installPath 'open-ledger-desktop.exe'
-          if (!(Test-Path $binary)) { throw 'Installed executable is missing' }
+          Get-ChildItem $installPath -Recurse | Select-Object FullName
+          $binaries = @(Get-ChildItem $installPath -Recurse -File | Where-Object { $_.Name -in @('open-ledger-desktop.exe', 'Open Ledger.exe') })
+          if ($binaries.Count -ne 1) { throw 'Expected exactly one installed application executable' }
+          $binary = $binaries[0].FullName
           "OPEN_LEDGER_BINARY=$binary" | Out-File -FilePath $env:GITHUB_ENV -Append
           $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
           $version = (Get-Item $edge).VersionInfo.ProductVersion
