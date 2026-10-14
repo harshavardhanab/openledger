@@ -1779,6 +1779,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "ledger-core",
+ "quick-xml",
  "rusqlite",
  "serde",
  "serde_json",

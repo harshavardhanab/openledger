@@ -46,6 +46,8 @@ pub struct DocumentLine {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gst: Option<crate::GstInput>,
     pub kind: String,
     pub date: String,
     pub due_date: Option<String>,
@@ -60,6 +62,8 @@ pub struct DocumentInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gst: Option<crate::GstCalculation>,
     pub id: i64,
     pub number: String,
     pub journal_id: i64,
@@ -136,6 +140,8 @@ pub struct BankLine {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct BusinessBackup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gst: Option<crate::GstProfile>,
     pub parties: Vec<Party>,
     pub items: Vec<Item>,
     pub documents: Vec<Document>,
@@ -146,7 +152,8 @@ pub struct BusinessBackup {
 }
 impl BusinessBackup {
     pub(crate) fn is_empty(&self) -> bool {
-        self.parties.is_empty()
+        self.gst.is_none()
+            && self.parties.is_empty()
             && self.items.is_empty()
             && self.documents.is_empty()
             && self.stock_moves.is_empty()
@@ -157,6 +164,7 @@ impl BusinessBackup {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct BusinessState {
+    pub gst: Option<crate::GstProfile>,
     pub parties: Vec<Party>,
     pub items: Vec<Item>,
     pub documents: Vec<DocumentView>,
@@ -214,6 +222,7 @@ fn validate_party(tx: &Transaction<'_>, p: &PartyInput) -> Result<()> {
             &["liability"]
         },
     )?;
+    crate::gst::check_gst_control(tx, p.account_id)?;
     let stock: i64 = tx.query_row(
         "SELECT COUNT(*) FROM items WHERE asset_account_id=?1",
         [p.account_id],
@@ -230,6 +239,7 @@ fn validate_item(tx: &Transaction<'_>, i: &ItemInput) -> Result<()> {
     validate_account(&i.code, &i.name)?;
     clean_text(&i.unit, "Unit", 20, true)?;
     account_kind(tx, i.asset_account_id, &["asset"])?;
+    crate::gst::check_gst_control(tx, i.asset_account_id)?;
     account_kind(tx, i.expense_account_id, &["expense"])?;
     let used:i64=tx.query_row("SELECT (SELECT COUNT(*) FROM parties WHERE account_id=?1)+(SELECT COUNT(*) FROM lines WHERE account_id=?1)",[i.asset_account_id],|r|r.get(0))?;
     // Once a dedicated inventory account has stock history, additional items may share it.
@@ -330,6 +340,7 @@ fn stock_totals(tx: &Transaction<'_>, item_id: i64) -> Result<(i64, i64)> {
     ))
 }
 struct Prepared {
+    gst: Option<crate::GstCalculation>,
     total: i64,
     lines: Vec<PostingInput>,
     moves: Vec<(i64, i64, i64)>,
@@ -347,7 +358,11 @@ fn prepare_document(
     if last_close.is_some_and(|s| d.date <= s) {
         return Err(invalid("This financial period is closed."));
     }
+    if d.gst.is_some() && !["sale", "purchase"].contains(&d.kind.as_str()) {
+        return Err(invalid("Only invoices support GST."));
+    }
     let mut result = Prepared {
+        gst: None,
         total: 0,
         lines: vec![],
         moves: vec![],
@@ -628,6 +643,33 @@ fn prepare_document(
     if result.total <= 0 {
         return Err(invalid("Document total must be positive."));
     }
+    if let Some((calc, accounts)) = crate::gst::calculate_gst(tx, d)? {
+        for (id, minor) in [
+            (accounts.cgst, &calc.cgst_minor),
+            (accounts.sgst, &calc.sgst_minor),
+            (accounts.igst, &calc.igst_minor),
+        ] {
+            let n = minor
+                .parse::<i64>()
+                .map_err(|_| invalid("Invalid GST total."))?;
+            if n > 0 {
+                result.total = result
+                    .total
+                    .checked_add(n)
+                    .ok_or_else(|| invalid("Invoice total exceeds range."))?;
+                result.lines.push(PostingInput {
+                    account_id: id,
+                    side: if d.kind == "sale" {
+                        Side::Credit
+                    } else {
+                        Side::Debit
+                    },
+                    amount: decimal_amount(n),
+                });
+            }
+        }
+        result.gst = Some(calc);
+    }
     if let Some(account) = control {
         result.lines.push(PostingInput {
             account_id: account,
@@ -727,12 +769,14 @@ impl LedgerStore {
         }
         let prepared = prepare_document(&tx, &input, None)?;
         let number = next_number(&tx, &input.kind)?;
+        crate::gst::validate_gst_number(&input, &number)?;
         let journal_id =
             insert_business_journal(&tx, &posting(&input, &prepared, &number)?, "document")?;
         let id: i64 = tx.query_row("SELECT COALESCE(MAX(id),0)+1 FROM documents", [], |r| {
             r.get(0)
         })?;
         let doc = Document {
+            gst: prepared.gst.clone(),
             id,
             number,
             journal_id,
@@ -792,7 +836,10 @@ impl LedgerStore {
         Ok(())
     }
     fn business_metadata(&self) -> Result<BusinessBackup> {
-        let mut result = BusinessBackup::default();
+        let mut result = BusinessBackup {
+            gst: self.gst_profile()?,
+            ..Default::default()
+        };
         let mut q = self
             .conn
             .prepare("SELECT id,name,kind,contact,account_id FROM parties ORDER BY id")?;
@@ -972,6 +1019,7 @@ impl LedgerStore {
             |r| r.get(0),
         )?;
         Ok(BusinessState {
+            gst: b.gst,
             parties: b.parties,
             items: b.items,
             documents: docs,
@@ -1256,6 +1304,13 @@ impl LedgerStore {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
+        if let Some(g) = &b.gst {
+            crate::gst::validate_gst_profile(&tx, g)?;
+            tx.execute(
+                "INSERT INTO gst_profile(id,data) VALUES(1,?1)",
+                [serde_json::to_string(g)?],
+            )?;
+        }
         for p in &b.parties {
             if p.id <= 0 {
                 return Err(invalid("Invalid party identifier."));
@@ -1290,6 +1345,9 @@ impl LedgerStore {
             }
             tx.execute("INSERT INTO items(id,code,name,unit,asset_account_id,expense_account_id) VALUES(?1,?2,?3,?4,?5,?6)",params![i.id,i.input.code,i.input.name,i.input.unit,i.input.asset_account_id,i.input.expense_account_id])?;
         }
+        if let Some(g) = &b.gst {
+            crate::gst::validate_gst_profile(&tx, g)?;
+        }
         let mut docs = b.documents.clone();
         docs.sort_by_key(|d| d.id);
         for d in &docs {
@@ -1298,6 +1356,10 @@ impl LedgerStore {
             }
             clean_text(&d.number, "Document number", 64, true)?;
             let prepared = prepare_document(&tx, &d.input, Some(d.journal_id))?;
+            crate::gst::validate_gst_number(&d.input, &d.number)?;
+            if d.gst != prepared.gst {
+                return Err(invalid("GST amounts do not match the invoice."));
+            }
             if d.total_minor != prepared.total.to_string() {
                 return Err(invalid("Document total does not match its lines."));
             }

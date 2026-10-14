@@ -156,7 +156,12 @@ export function csv(rows: (string | number)[][]) {
       row
         .map((cell) => {
           let value = String(cell);
-          if (typeof cell === 'string' && /^[=+@\-]/.test(value)) value = `'${value}`;
+          if (
+            typeof cell === 'string' &&
+            /^[=+@\-]/.test(value) &&
+            !/^-?\d+(?:\.\d+)?$/.test(value)
+          )
+            value = `'${value}`;
           return `"${value.replaceAll('"', '""')}"`;
         })
         .join(','),

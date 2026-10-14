@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { test, expect, Page, APIRequestContext } from '@playwright/test';
 async function api(request: APIRequestContext, command: string, payload: object = {}) {
   const response = await request.post(`/api/${command}`, { data: payload });
@@ -214,4 +215,76 @@ test('bank reconciliation and empty-earnings period closing work through the int
     },
   });
   expect(failed.ok()).toBe(false);
+});
+
+test('India GST setup, invoice tax and register work through the interface', async ({
+  page,
+  request,
+}) => {
+  await company(page, request, 'India GST UI');
+  await nav(page, 'Company & periods');
+  await page.getByRole('button', { name: 'Create standard GST accounts', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('GST control accounts ready');
+  await page.getByLabel('Company GSTIN').fill('29ABCDE1234F1Z5');
+  await page.getByLabel('Registration state code').fill('29');
+  await page.getByLabel('Registration state name').fill('Karnataka');
+  await page.getByLabel('Registered postal address').fill('Synthetic registered office, Bengaluru');
+  await page.getByRole('button', { name: 'Configure GST registration', exact: true }).click();
+  await expect(page.getByText('29ABCDE1234F1Z5 · Karnataka (29)', { exact: true })).toBeVisible();
+  await api(request, 'create_party', {
+    name: 'GST buyer',
+    kind: 'customer',
+    contact: '',
+    account_id: 3,
+  });
+  await page.reload();
+  await nav(page, 'Invoices & settlements');
+  await page.getByRole('button', { name: 'New sales invoice' }).click();
+  await page.getByLabel('Customer', { exact: true }).selectOption({ label: 'GST buyer' });
+  await page.getByLabel('Description', { exact: true }).fill('Synthetic service');
+  await page.getByLabel('Unit price', { exact: true }).fill('1000');
+  await page.getByLabel('Posting account').selectOption('7');
+  await page.getByRole('checkbox', { name: 'Calculate India regular GST' }).check();
+  await page.getByLabel('Counterparty postal address').fill('Synthetic recipient address');
+  await page.getByLabel('Delivery address').fill('Synthetic service delivery address');
+  await page.getByLabel('Reviewed GST rate (%)').fill('18');
+  await page.getByLabel('HSN / SAC').fill('998314');
+  await page.getByRole('button', { name: 'Review document' }).click();
+  await expect(page.getByText('Total: ₹1,180.00', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Post sales invoice' }).click();
+  await expect(page.getByRole('button', { name: 'INV-000001', exact: true })).toBeVisible();
+  const b = await api(request, 'business');
+  expect(b.documents[0].gst.cgst_minor).toBe('9000');
+  expect(b.documents[0].gst.sgst_minor).toBe('9000');
+  await nav(page, 'Financial statements');
+  await expect(
+    page.getByRole('heading', { name: 'GST accounting register', exact: true }),
+  ).toBeVisible();
+  const download = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export GST register', exact: true }).click();
+  expect((await download).suggestedFilename()).toContain('gst-register');
+});
+
+test('experimental Tally XML mapping, preview and import work through the interface', async ({
+  page,
+  request,
+}) => {
+  await company(page, request, 'Tally mapping UI');
+  await nav(page, 'Company & periods');
+  await page
+    .getByLabel('Tally voucher XML')
+    .fill(readFileSync('crates/ledger-store/tests/fixtures/tally-general.xml', 'utf8'));
+  await page.getByRole('button', { name: 'Inspect Tally XML', exact: true }).click();
+  await page.getByLabel('Map Tally ledger: Bank & Cash').selectOption('2');
+  await page.getByLabel('Map Tally ledger: Capital').selectOption('6');
+  await page.getByLabel('Stable source company ID').fill('synthetic-book');
+  await page
+    .getByRole('checkbox', { name: 'I confirmed the source and destination books use INR.' })
+    .check();
+  await page.getByRole('button', { name: 'Preview mapped Tally import', exact: true }).click();
+  await expect(page.getByText(/1 vouchers validated/)).toBeVisible();
+  expect((await api(request, 'state')).journal_count).toBe(0);
+  await page.getByRole('button', { name: 'Import mapped Tally vouchers', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Tally general vouchers imported');
+  expect((await api(request, 'state')).journal_count).toBe(1);
 });

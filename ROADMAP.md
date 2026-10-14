@@ -22,10 +22,11 @@ See [accounting workflows](docs/ACCOUNTING.md) for posting rules and correction 
 - [x] Consecutive financial periods, opening-balance journal workflow, closing to equity and automatic balance carry-forward.
 - [x] Inventory items, fractional units, movement audit, perpetual weighted average valuation and adjustments.
 - [ ] Inventory invoice credit/debit notes and cancellation with linked stock returns. Separate journal reversal is deliberately rejected for stock documents. Tracked in [#5](https://github.com/harshavardhanab/openledger/issues/5).
-- [ ] Jurisdiction-specific taxes and reporting after separate specification and verification. Country/regime and expected worked examples are required. Tracked in [#3](https://github.com/harshavardhanab/openledger/issues/3).
+- [x] Scoped India regular GST specification, reviewed rates/HSN, exact CGST/SGST-or-UTGST/IGST postings and an accounting register. See [India GST scope](docs/INDIA_GST.md).
+- [ ] Independent India tax verification, statutory return payloads/filing and special tax workflows outside that scope. Tracked in [#3](https://github.com/harshavardhanab/openledger/issues/3).
 - [x] Documented native import/export formats and atomic journal-import preview/commit.
-- [x] Separately designed Tally adapter requirements in [import/export contracts](docs/IMPORT_EXPORT.md).
-- [ ] Implement and verify that Tally adapter against anonymized exports from explicitly supported versions/dialects. No export fixture was supplied. Tracked in [#4](https://github.com/harshavardhanab/openledger/issues/4).
+- [x] Separately designed, experimental Tally general-voucher XML adapter with explicit mapping, preview, atomic commit, stable source IDs and rejection of unsupported data. See [import/export contracts](docs/IMPORT_EXPORT.md).
+- [ ] Extend and verify Tally adapters against anonymized exports from explicitly supported versions/dialects. No export fixture was supplied. Tracked in [#4](https://github.com/harshavardhanab/openledger/issues/4).
 
 ## Before a stable release
 

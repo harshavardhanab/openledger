@@ -60,8 +60,8 @@ impl LedgerService {
                     let entry = entry?;
                     let name = entry.file_name().to_string_lossy().to_string();
                     if valid_book_name(&name) || entry.path() == self.default_path {
-                        let book = LedgerStore::open(&entry.path())?;
-                        books.push(json!({"file":name,"company":book.company()?}));
+                        let company = LedgerStore::inspect_company(&entry.path())?;
+                        books.push(json!({"file":name,"company":company}));
                     }
                 }
                 json!({"books":books,"active":std::fs::read_to_string(&self.active_path).unwrap_or_else(|_|self.default_path.file_name().unwrap().to_string_lossy().into_owned())})
@@ -106,6 +106,15 @@ impl LedgerService {
                 }
                 *store = next;
                 serde_json::to_value(store.snapshot()?)?
+            }
+            "configure_gst" => {
+                store.configure_gst(serde_json::from_value(payload)?)?;
+                json!({"saved":true})
+            }
+            "gst_control_accounts" => store.gst_control_accounts()?,
+            "gst_report" => {
+                let input: GstReportQuery = serde_json::from_value(payload)?;
+                store.gst_report(&input.from, &input.to)?
             }
             "business" => {
                 let input: BusinessQuery = serde_json::from_value(payload)?;
@@ -175,6 +184,20 @@ impl LedgerService {
                 let input: PageQuery = serde_json::from_value(payload)?;
                 serde_json::to_value(store.journals_page(input.offset, input.limit)?)?
             }
+            "inspect_tally" => {
+                let input: RestoreInput = serde_json::from_value(payload)?;
+                serde_json::to_value(crate::inspect_tally(&input.contents)?)?
+            }
+            "import_tally" => {
+                let input: crate::TallyImport = serde_json::from_value(payload)?;
+                if store.company()?.is_none_or(|c| c.currency != "INR") {
+                    return Err(StoreError::Conflict(
+                        "The experimental Tally profile requires INR destination books.".into(),
+                    ));
+                }
+                let journals = input.journals()?;
+                import_entries(&mut store, journals, input.preview)?
+            }
             "import_journals" => {
                 let input: ImportInput = serde_json::from_value(payload)?;
                 if input.format != "open-ledger-journals"
@@ -185,19 +208,9 @@ impl LedgerService {
                         "Unsupported import format or batch size.".into(),
                     ));
                 }
-                let (mut stage, _) = LedgerStore::prepare_restore(&store.export_backup()?)?;
-                let mut ids = vec![];
-                for journal in input.journals {
-                    ids.push(stage.post(journal)?);
-                }
-                let tb = stage.trial_balance(None)?;
-                if input.preview {
-                    json!({"count":ids.len(),"trial_balance":tb})
-                } else {
-                    store.replace_with(&stage)?;
-                    json!({"count":ids.len(),"trial_balance":tb})
-                }
+                import_entries(&mut store, input.journals, input.preview)?
             }
+
             "state" => serde_json::to_value(store.snapshot()?)?,
             "journal" => {
                 let input: JournalId = serde_json::from_value(payload)?;
@@ -398,4 +411,28 @@ struct LedgerPageInput {
     to: Option<String>,
     offset: i64,
     limit: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GstReportQuery {
+    from: String,
+    to: String,
+}
+
+fn import_entries(
+    store: &mut LedgerStore,
+    journals: Vec<JournalInput>,
+    preview: bool,
+) -> crate::Result<Value> {
+    let (mut stage, _) = LedgerStore::prepare_restore(&store.export_backup()?)?;
+    let mut ids = vec![];
+    for journal in journals {
+        ids.push(stage.post(journal)?);
+    }
+    let tb = stage.trial_balance(None)?;
+    if !preview {
+        store.replace_with(&stage)?;
+    }
+    Ok(json!({"count":ids.len(),"trial_balance":tb}))
 }

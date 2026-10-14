@@ -179,6 +179,18 @@ impl LedgerStore {
         }
         Self::initialize(Connection::open(path)?, true)
     }
+    pub fn inspect_company(path: &Path) -> Result<Option<Company>> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let app_id: i64 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if app_id != 1330399058 || !(1..=3).contains(&version) {
+            return Err(invalid(
+                "Books file is unsupported or belongs to another application.",
+            ));
+        }
+        Self { conn }.company()
+    }
     pub fn memory() -> Result<Self> {
         Self::initialize(Connection::open_in_memory()?, false)
     }
@@ -190,7 +202,7 @@ impl LedgerStore {
         if app_id != 0 && app_id != 1330399058 {
             return Err(invalid("This file belongs to a different application."));
         }
-        if version > 2 {
+        if version > 3 {
             return Err(invalid(
                 "This database needs a newer version of Open Ledger.",
             ));
@@ -206,6 +218,9 @@ impl LedgerStore {
         }
         if version < 2 {
             conn.execute_batch(include_str!("migration_v2.sql"))?;
+        }
+        if version < 3 {
+            conn.execute_batch(include_str!("migration_v3.sql"))?;
         }
         if wal {
             conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -630,7 +645,7 @@ impl LedgerStore {
         }
         Ok(serde_json::to_string_pretty(&Backup {
             format: "open-ledger-backup".into(),
-            version: 2,
+            version: 3,
             exported_at: now(),
             company,
             accounts,
@@ -643,17 +658,34 @@ impl LedgerStore {
             return Err(invalid("This milestone supports backups up to 20 MB."));
         }
         let raw: serde_json::Value = serde_json::from_str(text)?;
-        if raw.get("version").and_then(|v| v.as_u64()) == Some(2) && raw.get("business").is_none() {
-            return Err(invalid("Version 2 backups require business records."));
+        if raw
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|n| n >= 2)
+            && raw.get("business").is_none()
+        {
+            return Err(invalid(
+                "Version 2 and newer backups require business records.",
+            ));
         }
         let mut backup: Backup = serde_json::from_value(raw)?;
-        if backup.format != "open-ledger-backup" || !(1..=2).contains(&backup.version) {
+        if backup.format != "open-ledger-backup" || !(1..=3).contains(&backup.version) {
             return Err(invalid("This is not a supported Open Ledger backup."));
         }
         if backup.version == 1 && !backup.business.is_empty() {
             return Err(invalid(
                 "Version 1 backups cannot contain business records.",
             ));
+        }
+        if backup.version < 3
+            && (backup.business.gst.is_some()
+                || backup
+                    .business
+                    .documents
+                    .iter()
+                    .any(|d| d.gst.is_some() || d.input.gst.is_some()))
+        {
+            return Err(invalid("GST records require backup version 3."));
         }
         chrono::DateTime::parse_from_rfc3339(&backup.exported_at)
             .map_err(|_| invalid("The backup date is invalid."))?;

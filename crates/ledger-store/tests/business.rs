@@ -23,6 +23,7 @@ fn party(s: &mut LedgerStore, kind: &str) -> Party {
 }
 fn invoice(kind: &str, pid: i64, key: &str, amount: &str) -> DocumentInput {
     DocumentInput {
+        gst: None,
         kind: kind.into(),
         date: "2026-10-01".into(),
         due_date: Some("2026-10-14".into()),
@@ -43,6 +44,7 @@ fn invoice(kind: &str, pid: i64, key: &str, amount: &str) -> DocumentInput {
 }
 fn receipt(invoice: &Document, key: &str, amount: &str) -> DocumentInput {
     DocumentInput {
+        gst: None,
         kind: if invoice.input.kind == "sale" {
             "receipt"
         } else {
@@ -564,6 +566,7 @@ fn stock_adjustments_are_balanced_and_forged_valuations_are_rejected() {
     let mut s = books();
     let item = inventory(&mut s);
     let input = DocumentInput {
+        gst: None,
         kind: "stock".into(),
         date: "2026-10-01".into(),
         due_date: None,

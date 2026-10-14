@@ -36,7 +36,43 @@ type DocLine = {
   account_id: number;
   item_id: number | null;
 };
+type GstAccounts = { cgst: number; sgst: number; igst: number };
+type GstProfile = {
+  gstin: string;
+  state_code: string;
+  state_name: string;
+  address: string;
+  output: GstAccounts;
+  input: GstAccounts;
+};
+type GstInput = {
+  supply_state: string;
+  supply_state_name: string;
+  counterparty_gstin: string | null;
+  counterparty_address: string;
+  delivery_address: string;
+  supplier_reference: string | null;
+  credit_reviewed: boolean;
+  rates_bps: number[];
+  hsn_sac: string[];
+};
+type GstCalculation = {
+  taxable_minor: string;
+  cgst_minor: string;
+  sgst_minor: string;
+  igst_minor: string;
+  lines: {
+    taxable_minor: string;
+    rate_bps: number;
+    hsn_sac: string;
+    cgst_minor: string;
+    sgst_minor: string;
+    igst_minor: string;
+  }[];
+};
+type ComposerLine = DocLine & { gst_rate?: string; hsn_sac?: string };
 type DocInput = {
+  gst?: GstInput;
   kind: string;
   date: string;
   due_date: string | null;
@@ -49,6 +85,7 @@ type DocInput = {
   request_id: string;
 };
 type Doc = {
+  gst?: GstCalculation;
   id: number;
   number: string;
   journal_id: number;
@@ -79,6 +116,7 @@ type Reconciliation = {
   };
 };
 type Business = {
+  gst: GstProfile | null;
   parties: Party[];
   items: Item[];
   documents: Doc[];
@@ -190,7 +228,7 @@ export function BusinessWorkspace(props: Props) {
       {props.page === 'inventory' && (
         <Inventory {...props} data={data} asOf={asOf} setAsOf={setAsOf} />
       )}
-      {props.page === 'statements' && <Statements {...props} />}
+      {props.page === 'statements' && <Statements {...props} gstConfigured={Boolean(data.gst)} />}
       {props.page === 'reconciliation' && <Bank {...props} data={data} />}
       {props.page === 'settings' && <Settings {...props} data={data} />}
     </div>
@@ -363,6 +401,7 @@ function Documents(
             {data.parties.find((p) => p.id === detail.input.party_id)?.input.contact}
           </p>
           <DocumentLines lines={detail.input.lines} currency={currency} />
+          {detail.gst && <GstAmounts calc={detail.gst} currency={currency} />}
           <p>{detail.input.note}</p>
           <strong>Total: {money(detail.total_minor, currency)}</strong>
           <div className="business-actions">
@@ -546,14 +585,53 @@ function DocumentComposer({
     [amount, setAmount] = useState(invoice ? decimal(BigInt(invoice.outstanding_minor)) : ''),
     [note, setNote] = useState(''),
     [direction, setDirection] = useState('add');
-  const [lines, setLines] = useState<DocLine[]>([
+  const [lines, setLines] = useState<ComposerLine[]>([
       { description: '', quantity: '1', unit_price: '', account_id: 0, item_id: null },
     ]),
     [review, setReview] = useState(false);
   const [requestId, setRequestId] = useState<string>(() => crypto.randomUUID());
-  const patch = (i: number, p: Partial<DocLine>) =>
+  const patch = (i: number, p: Partial<ComposerLine>) =>
     setLines((v) => v.map((l, n) => (i === n ? { ...l, ...p } : l)));
+  const [gstEnabled, setGstEnabled] = useState(false),
+    [supplyState, setSupplyState] = useState(data.gst?.state_code || ''),
+    [supplyName, setSupplyName] = useState(data.gst?.state_name || ''),
+    [gstin, setGstin] = useState(''),
+    [taxAddress, setTaxAddress] = useState(''),
+    [delivery, setDelivery] = useState(''),
+    [supplierRef, setSupplierRef] = useState(''),
+    [creditReviewed, setCreditReviewed] = useState(false);
+  const gstInput: GstInput = {
+    supply_state: supplyState,
+    supply_state_name: supplyName,
+    counterparty_gstin: gstin || null,
+    counterparty_address: taxAddress,
+    delivery_address: delivery,
+    supplier_reference: kind === 'purchase' ? supplierRef : null,
+    credit_reviewed: kind === 'purchase' ? creditReviewed : false,
+    rates_bps: lines.map((l) => Number(parseMinor(l.gst_rate || '') || 0n)),
+    hsn_sac: lines.map((l) => l.hsn_sac || ''),
+  };
+  const gstPreview = () => {
+    let c = 0n,
+      i = 0n;
+    const local = (kind === 'sale' ? data.gst?.state_code : gstin.slice(0, 2)) === supplyState;
+    for (const l of lines) {
+      const base = lineTotal(l),
+        rate = parseMinor(l.gst_rate || '') || 0n;
+      if (local) c += (base * rate + 10000n) / 20000n;
+      else i += (base * rate + 5000n) / 10000n;
+    }
+    return {
+      cgst_minor: c.toString(),
+      sgst_minor: c.toString(),
+      igst_minor: i.toString(),
+      taxable_minor: lines.reduce((v, l) => v + lineTotal(l), 0n).toString(),
+      lines: [],
+    };
+  };
+  const calculatedGst = gstEnabled ? gstPreview() : null;
   const payload: DocInput = {
+    ...(gstEnabled ? { gst: gstInput } : {}),
     kind,
     date,
     due_date: settlement || stock ? null : due,
@@ -562,12 +640,17 @@ function DocumentComposer({
     money_account_id: settlement ? bank : null,
     amount: settlement ? amount : null,
     note,
-    lines: settlement ? [] : lines,
+    lines: settlement ? [] : lines.map(({ gst_rate, hsn_sac, ...line }) => line),
     request_id: requestId,
   };
   const total = settlement
     ? parseMinor(amount) || 0n
-    : lines.reduce((v, l) => v + lineTotal(l), 0n);
+    : lines.reduce((v, l) => v + lineTotal(l), 0n) +
+      (calculatedGst
+        ? BigInt(calculatedGst.cgst_minor) +
+          BigInt(calculatedGst.sgst_minor) +
+          BigInt(calculatedGst.igst_minor)
+        : 0n);
   const currency = state.company!.currency;
   const draftKey = `open-ledger-draft:${state.company!.created_at}:${state.company!.name}:${kind}`;
   const saveDraft = () => {
@@ -597,7 +680,24 @@ function DocumentComposer({
       setDue(d.due_date || today());
       setParty(d.party_id || 0);
       setNote(d.note);
-      setLines(d.lines);
+      setLines(
+        d.lines.map((l, i) => ({
+          ...l,
+          ...(d.gst
+            ? { gst_rate: decimal(BigInt(d.gst.rates_bps[i])), hsn_sac: d.gst.hsn_sac[i] }
+            : {}),
+        })),
+      );
+      setGstEnabled(Boolean(d.gst));
+      if (d.gst) {
+        setSupplyState(d.gst.supply_state);
+        setSupplyName(d.gst.supply_state_name);
+        setGstin(d.gst.counterparty_gstin || '');
+        setTaxAddress(d.gst.counterparty_address);
+        setDelivery(d.gst.delivery_address);
+        setSupplierRef(d.gst.supplier_reference || '');
+        setCreditReviewed(d.gst.credit_reviewed);
+      }
       setRequestId(d.request_id);
     } catch {
       /* A damaged local draft does not affect books. */
@@ -622,6 +722,7 @@ function DocumentComposer({
             {due && !settlement && !stock ? `· Due ${displayDate(due)}` : ''}
           </p>
           {!settlement && <DocumentLines lines={lines} currency={currency} />}
+          {calculatedGst && <GstAmounts calc={calculatedGst} currency={currency} />}
           <p>{note}</p>
           <strong>
             {stock && direction === 'remove'
@@ -743,6 +844,93 @@ function DocumentComposer({
               <input maxLength={500} value={note} onChange={(e) => setNote(e.target.value)} />
             </Field>
           </div>
+          {!settlement && !stock && data.gst && (
+            <>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={gstEnabled}
+                  onChange={(e) => setGstEnabled(e.target.checked)}
+                />
+                Calculate India regular GST
+              </label>
+              {gstEnabled && (
+                <fieldset className="document-line">
+                  <legend>Domestic GST particulars</legend>
+                  <div className="business-grid">
+                    <Field name="Place of supply state code">
+                      <input
+                        required
+                        maxLength={2}
+                        value={supplyState}
+                        onChange={(e) => setSupplyState(e.target.value)}
+                      />
+                    </Field>
+                    <Field name="Place of supply state name">
+                      <input
+                        required
+                        maxLength={80}
+                        value={supplyName}
+                        onChange={(e) => setSupplyName(e.target.value)}
+                      />
+                    </Field>
+                    <Field
+                      name={kind === 'sale' ? 'Recipient GSTIN (if registered)' : 'Supplier GSTIN'}
+                    >
+                      <input
+                        required={kind === 'purchase'}
+                        maxLength={15}
+                        value={gstin}
+                        onChange={(e) => setGstin(e.target.value.toUpperCase())}
+                      />
+                    </Field>
+                    <Field name="Counterparty postal address">
+                      <input
+                        required
+                        maxLength={500}
+                        value={taxAddress}
+                        onChange={(e) => setTaxAddress(e.target.value)}
+                      />
+                    </Field>
+                    <Field name="Delivery address">
+                      <input
+                        required
+                        maxLength={500}
+                        value={delivery}
+                        onChange={(e) => setDelivery(e.target.value)}
+                      />
+                    </Field>
+                    {kind === 'purchase' && (
+                      <Field name="Supplier tax invoice reference">
+                        <input
+                          required
+                          maxLength={16}
+                          value={supplierRef}
+                          onChange={(e) => setSupplierRef(e.target.value)}
+                        />
+                      </Field>
+                    )}
+                  </div>
+                  {kind === 'purchase' && (
+                    <label className="checkbox-label">
+                      <input
+                        required
+                        type="checkbox"
+                        checked={creditReviewed}
+                        onChange={(e) => setCreditReviewed(e.target.checked)}
+                      />
+                      I independently reviewed input tax credit eligibility.
+                    </label>
+                  )}
+                  <p className="form-hint">
+                    Domestic forward-charge supplies only. Exports, SEZ, reverse charge,
+                    composition, cess, e-invoicing and statutory return filing require separate
+                    workflows.
+                  </p>
+                </fieldset>
+              )}
+            </>
+          )}
           {!settlement && (
             <>
               {lines.map((l, i) => (
@@ -783,6 +971,26 @@ function DocumentComposer({
                         onChange={(e) => patch(i, { description: e.target.value })}
                       />
                     </Field>
+                    {gstEnabled && (
+                      <>
+                        <Field name="Reviewed GST rate (%)">
+                          <input
+                            required
+                            inputMode="decimal"
+                            value={l.gst_rate || ''}
+                            onChange={(e) => patch(i, { gst_rate: e.target.value })}
+                          />
+                        </Field>
+                        <Field name="HSN / SAC">
+                          <input
+                            required
+                            maxLength={8}
+                            value={l.hsn_sac || ''}
+                            onChange={(e) => patch(i, { hsn_sac: e.target.value })}
+                          />
+                        </Field>
+                      </>
+                    )}
                     <Field name="Quantity (up to 3 decimals)">
                       <input
                         required
@@ -1099,7 +1307,7 @@ type StatementsData = {
   current_earnings_minor: string;
   balanced: boolean;
 };
-function Statements({ state, onError }: Props) {
+function Statements({ state, onError, gstConfigured }: Props & { gstConfigured: boolean }) {
   const [from, setFrom] = useState(state.company!.fiscal_year_start),
     [asOf, setAsOf] = useState(today()),
     [report, setReport] = useState<StatementsData | null>(null);
@@ -1147,6 +1355,7 @@ function Statements({ state, onError }: Props) {
     );
   return (
     <>
+      {gstConfigured && <GstReport state={state} onError={onError} />}
       <section className="panel filter-panel">
         <Field name="Profit and loss from">
           <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
@@ -1453,6 +1662,8 @@ function Settings(props: Props & { data: Business }) {
   }, [state]);
   return (
     <>
+      {state.company!.currency === 'INR' && <GstSettings {...props} />}
+      <TallyImporter {...props} />
       <section className="panel business-card">
         <h3>Company books</h3>
         <div className="business-grid">
@@ -1730,7 +1941,12 @@ function exportDocument(d: Doc, data: Business, state: Snapshot, print = false) 
       .replaceAll('"', '&quot;');
   const party = data.parties.find((p) => p.id === d.input.party_id);
   const currency = state.company!.currency;
-  const html = `<!doctype html><html lang="en"><meta charset="utf-8"><title>${escape(d.number)}</title><style>body{font:16px system-ui;color:#20372e;max-width:850px;margin:48px auto;padding:24px}table{width:100%;border-collapse:collapse;margin:32px 0}td,th{text-align:left;border-bottom:1px solid #ddd;padding:12px}small{color:#667}</style><h1>${escape(state.company!.name)}</h1><h2>${escape(docNames[d.input.kind])} ${escape(d.number)}</h2><p>${escape(d.input.date)}${d.input.due_date ? ` · Due ${escape(d.input.due_date)}` : ''}${d.reversed ? ' · REVERSED' : ''}</p><h3>${escape(party?.input.name || '')}</h3><p>${escape(party?.input.contact || '')}</p><table><thead><tr><th>Description</th><th>Quantity</th><th>Unit price</th><th>Amount</th></tr></thead><tbody>${d.input.lines.map((l) => `<tr><td>${escape(l.description)}</td><td>${escape(l.quantity)}</td><td>${escape(money(parseMinor(l.unit_price) || 0n, currency))}</td><td>${escape(money(lineTotal(l), currency))}</td></tr>`).join('')}</tbody></table><h3>Total ${escape(money(d.total_minor, currency))}</h3><p>${escape(d.input.note)}</p><small>Open Ledger · General accounting document · No jurisdiction-specific tax calculation</small></html>`;
+  const g = d.input.gst;
+  const gstHtml =
+    d.gst && g && data.gst
+      ? `<h3>India GST invoice particulars</h3><p>Supplier: ${escape(d.input.kind === 'sale' ? state.company!.name : party?.input.name || '')} · Registration: ${escape(d.input.kind === 'sale' ? data.gst.gstin : g.counterparty_gstin || '')} · ${escape(d.input.kind === 'sale' ? data.gst.address : g.counterparty_address)}</p><p>Recipient registration: ${escape(d.input.kind === 'sale' ? g.counterparty_gstin || 'Unregistered' : data.gst.gstin)} · ${escape(d.input.kind === 'sale' ? g.counterparty_address : data.gst.address)}</p><p>Place of supply: ${escape(g.supply_state_name)} (${escape(g.supply_state)}) · Delivery: ${escape(g.delivery_address)}</p>${g.supplier_reference ? `<p>Supplier invoice: ${escape(g.supplier_reference)}</p>` : ''}<table><thead><tr><th>HSN/SAC</th><th>Rate %</th><th>Taxable</th><th>CGST</th><th>SGST/UTGST</th><th>IGST</th></tr></thead><tbody>${d.gst.lines.map((l) => `<tr><td>${escape(l.hsn_sac)}</td><td>${escape(decimal(BigInt(l.rate_bps)))}</td><td>${escape(money(l.taxable_minor, currency))}</td><td>${escape(money(l.cgst_minor, currency))}</td><td>${escape(money(l.sgst_minor, currency))}</td><td>${escape(money(l.igst_minor, currency))}</td></tr>`).join('')}</tbody></table><p>Taxable: ${escape(money(d.gst.taxable_minor, currency))} · CGST: ${escape(money(d.gst.cgst_minor, currency))} · SGST/UTGST: ${escape(money(d.gst.sgst_minor, currency))} · IGST: ${escape(money(d.gst.igst_minor, currency))}</p><p>Reverse charge: No · Supplier authorization/signature: __________________</p>`
+      : '';
+  const html = `<!doctype html><html lang="en"><meta charset="utf-8"><title>${escape(d.number)}</title><style>body{font:16px system-ui;color:#20372e;max-width:850px;margin:48px auto;padding:24px}table{width:100%;border-collapse:collapse;margin:32px 0}td,th{text-align:left;border-bottom:1px solid #ddd;padding:12px}small{color:#667}</style><h1>${escape(state.company!.name)}</h1><h2>${escape(docNames[d.input.kind])} ${escape(d.number)}</h2><p>${escape(d.input.date)}${d.input.due_date ? ` · Due ${escape(d.input.due_date)}` : ''}${d.reversed ? ' · REVERSED' : ''}</p><h3>${escape(party?.input.name || '')}</h3><p>${escape(party?.input.contact || '')}</p><table><thead><tr><th>Description</th><th>Quantity</th><th>Unit price</th><th>Amount</th></tr></thead><tbody>${d.input.lines.map((l) => `<tr><td>${escape(l.description)}</td><td>${escape(l.quantity)} ${escape(data.items.find((i) => i.id === l.item_id)?.input.unit || '')}</td><td>${escape(money(parseMinor(l.unit_price) || 0n, currency))}</td><td>${escape(money(lineTotal(l), currency))}</td></tr>`).join('')}</tbody></table>${gstHtml}<h3>Total ${escape(money(d.total_minor, currency))}</h3><p>${escape(d.input.note)}</p><small>${d.gst ? 'Open Ledger · Domestic regular GST accounting · Review legal particulars and supplier authorization before issue' : 'Open Ledger · General accounting document · No GST calculation'}</small></html>`;
   if (print) {
     const frame = document.createElement('iframe');
     frame.className = 'print-frame';
@@ -1743,4 +1959,422 @@ function exportDocument(d: Doc, data: Business, state: Snapshot, print = false) 
     };
     document.body.append(frame);
   } else download(`${d.number.replace(/[^a-z0-9_-]/gi, '_')}.html`, html, 'text/html');
+}
+
+function GstAmounts({ calc, currency }: { calc: GstCalculation; currency: string }) {
+  return (
+    <div className="ledger-summary">
+      {[
+        ['Taxable', calc.taxable_minor],
+        ['CGST', calc.cgst_minor],
+        ['SGST / UTGST', calc.sgst_minor],
+        ['IGST', calc.igst_minor],
+      ].map(([name, value]) => (
+        <div key={name}>
+          <span>{name}</span>
+          <strong>{money(value, currency)}</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+function GstSettings({ state, data, busy, mutate }: Props & { data: Business }) {
+  const [gstin, setGstin] = useState(''),
+    [code, setCode] = useState(''),
+    [name, setName] = useState(''),
+    [address, setAddress] = useState('');
+  const [output, setOutput] = useState<GstAccounts>({ cgst: 0, sgst: 0, igst: 0 }),
+    [input, setInput] = useState<GstAccounts>({ cgst: 0, sgst: 0, igst: 0 });
+  useEffect(() => {
+    if (!data.gst) {
+      setOutput({
+        cgst: state.accounts.find((a) => a.code === '2101')?.id || 0,
+        sgst: state.accounts.find((a) => a.code === '2102')?.id || 0,
+        igst: state.accounts.find((a) => a.code === '2103')?.id || 0,
+      });
+      setInput({
+        cgst: state.accounts.find((a) => a.code === '1401')?.id || 0,
+        sgst: state.accounts.find((a) => a.code === '1402')?.id || 0,
+        igst: state.accounts.find((a) => a.code === '1403')?.id || 0,
+      });
+    }
+  }, [state, data.gst]);
+  return (
+    <section className="panel business-card">
+      <h3>India regular GST registration</h3>
+      {data.gst ? (
+        <>
+          <p>
+            {data.gst.gstin} · {data.gst.state_name} ({data.gst.state_code})
+          </p>
+          <p>{data.gst.address}</p>
+          <p className="form-hint">
+            Registration and tax mappings are fixed for these books. GSTIN format checks do not
+            verify registration status. Use a separate company file for another registration.
+          </p>
+        </>
+      ) : (
+        <>
+          <p className="form-hint">
+            Configure a single regular GST registration in INR books. Confirm the registration,
+            state, tax rates, HSN/SAC and input-credit eligibility independently. This does not
+            enable GST Portal filing or IRN generation.
+          </p>
+          <button
+            className="button secondary"
+            disabled={busy}
+            onClick={() => void mutate('gst_control_accounts', {}, 'GST control accounts ready.')}
+          >
+            Create standard GST accounts
+          </button>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void mutate(
+                'configure_gst',
+                { gstin, state_code: code, state_name: name, address, output, input },
+                'GST registration configured.',
+              );
+            }}
+          >
+            <div className="business-grid">
+              <Field name="Company GSTIN">
+                <input
+                  required
+                  maxLength={15}
+                  value={gstin}
+                  onChange={(e) => setGstin(e.target.value.toUpperCase())}
+                />
+              </Field>
+              <Field name="Registration state code">
+                <input
+                  required
+                  maxLength={2}
+                  value={code}
+                  onChange={(e) => setCode(e.target.value)}
+                />
+              </Field>
+              <Field name="Registration state name">
+                <input
+                  required
+                  maxLength={80}
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                />
+              </Field>
+              <Field name="Registered postal address">
+                <input
+                  required
+                  maxLength={500}
+                  value={address}
+                  onChange={(e) => setAddress(e.target.value)}
+                />
+              </Field>
+              {(['cgst', 'sgst', 'igst'] as const).map((k) => (
+                <React.Fragment key={k}>
+                  <AccountSelect
+                    accounts={state.accounts}
+                    kinds={['liability']}
+                    value={output[k]}
+                    change={(v) => setOutput((p) => ({ ...p, [k]: v }))}
+                    label={`Output ${k.toUpperCase()} account`}
+                  />
+                  <AccountSelect
+                    accounts={state.accounts}
+                    kinds={['asset']}
+                    value={input[k]}
+                    change={(v) => setInput((p) => ({ ...p, [k]: v }))}
+                    label={`Input ${k.toUpperCase()} account`}
+                  />
+                </React.Fragment>
+              ))}
+            </div>
+            <div className="business-actions">
+              <button className="button primary" disabled={busy}>
+                Configure GST registration
+              </button>
+            </div>
+          </form>
+        </>
+      )}
+    </section>
+  );
+}
+function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) => void }) {
+  const [from, setFrom] = useState(state.company!.fiscal_year_start),
+    [to, setTo] = useState(today()),
+    [report, setReport] = useState<{
+      rows: {
+        number: string;
+        kind: string;
+        date: string;
+        event: string;
+        sign: number;
+        counterparty_gstin: string | null;
+        supply_state: string;
+        amounts: GstCalculation;
+      }[];
+      totals: Record<
+        string,
+        { taxable_minor: string; cgst_minor: string; sgst_minor: string; igst_minor: string }
+      >;
+    } | null>(null);
+  useEffect(() => {
+    let live = true;
+    void request<typeof report>('gst_report', { from, to })
+      .then((v) => {
+        if (live) setReport(v);
+      })
+      .catch((e) => {
+        if (live) onError(err(e));
+      });
+    return () => {
+      live = false;
+    };
+  }, [state, from, to]);
+  if (!report) return null;
+  return (
+    <section className="panel business-card">
+      <h3>GST accounting register</h3>
+      <p className="form-hint">
+        Review worksheet for supported domestic invoices. Accounting reversals are shown on their
+        effective date; they are not statutory credit notes. This export is not a GSTR-1/GSTR-3B
+        filing payload.
+      </p>
+      <div className="business-grid">
+        <Field name="GST register from">
+          <input type="date" required value={from} onChange={(e) => setFrom(e.target.value)} />
+        </Field>
+        <Field name="GST register through">
+          <input type="date" required value={to} onChange={(e) => setTo(e.target.value)} />
+        </Field>
+      </div>
+      <div className="business-actions">
+        <button
+          className="button secondary"
+          onClick={() =>
+            download(
+              `gst-register-${from}-${to}.csv`,
+              csv([
+                [
+                  'Number',
+                  'Kind',
+                  'Date',
+                  'Event',
+                  'GSTIN',
+                  'Place of supply',
+                  'Line',
+                  'HSN / SAC',
+                  'Rate basis points',
+                  'Taxable minor',
+                  'CGST minor',
+                  'SGST / UTGST minor',
+                  'IGST minor',
+                ],
+                ...report.rows.flatMap((r) =>
+                  r.amounts.lines.map((l, index) => [
+                    r.number,
+                    r.kind,
+                    r.date,
+                    r.event,
+                    r.counterparty_gstin || '',
+                    r.supply_state,
+                    index + 1,
+                    l.hsn_sac,
+                    l.rate_bps,
+                    (BigInt(l.taxable_minor) * BigInt(r.sign)).toString(),
+                    (BigInt(l.cgst_minor) * BigInt(r.sign)).toString(),
+                    (BigInt(l.sgst_minor) * BigInt(r.sign)).toString(),
+                    (BigInt(l.igst_minor) * BigInt(r.sign)).toString(),
+                  ]),
+                ),
+              ]),
+              'text/csv',
+            )
+          }
+        >
+          Export GST register
+        </button>
+      </div>
+      <div className="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Type</th>
+              <th>Taxable</th>
+              <th>CGST</th>
+              <th>SGST / UTGST</th>
+              <th>IGST</th>
+            </tr>
+          </thead>
+          <tbody>
+            {Object.entries(report.totals).map(([kind, r]) => (
+              <tr key={kind}>
+                <td>{kind === 'sale' ? 'Outward supplies' : 'Reviewed inward ITC'}</td>
+                <td>{money(r.taxable_minor, 'INR')}</td>
+                <td>{money(r.cgst_minor, 'INR')}</td>
+                <td>{money(r.sgst_minor, 'INR')}</td>
+                <td>{money(r.igst_minor, 'INR')}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function TallyImporter({ state, busy, mutate, onError }: Props) {
+  const [contents, setContents] = useState(''),
+    [source, setSource] = useState(''),
+    [confirmed, setConfirmed] = useState(false),
+    [inspection, setInspection] = useState<{
+      ledgers: string[];
+      vouchers: { guid: string; date: string; number: string; kind: string }[];
+    } | null>(null),
+    [maps, setMaps] = useState<Record<string, number>>({}),
+    [preview, setPreview] = useState<{
+      count: number;
+      trial_balance: { debit_minor: string; credit_minor: string; balanced: boolean };
+    } | null>(null);
+  const payload = { contents, source_id: source, currency: 'INR', accounts: maps, preview: true };
+  return (
+    <section className="panel business-card">
+      <h3>Experimental Tally XML general-voucher import</h3>
+      <p className="form-hint">
+        Supports only simple Journal, Receipt, Payment and Contra vouchers with GUIDs and no
+        allocations. Invoice, stock, GST, master, optional/cancelled and foreign-currency structures
+        are rejected. Validate on a copy of books and compare source totals. Compatibility with your
+        Tally version requires a representative export.
+      </p>
+      <Field name="Tally voucher XML">
+        <textarea
+          rows={7}
+          value={contents}
+          onChange={(e) => {
+            setContents(e.target.value);
+            setInspection(null);
+            setPreview(null);
+          }}
+        />
+      </Field>
+      <Field name="Load Tally XML file">
+        <input
+          type="file"
+          accept=".xml"
+          onChange={async (e) => {
+            const f = e.target.files?.[0];
+            if (!f) return;
+            if (f.size > 20 * 1024 * 1024) {
+              onError('Tally XML is limited to 20 MiB.');
+              return;
+            }
+            setContents(await f.text());
+            setInspection(null);
+            setPreview(null);
+          }}
+        />
+      </Field>
+      <button
+        className="button secondary"
+        disabled={busy}
+        onClick={async () => {
+          try {
+            setInspection(await request('inspect_tally', { contents }));
+            setMaps({});
+            setPreview(null);
+          } catch (e) {
+            onError(err(e));
+          }
+        }}
+      >
+        Inspect Tally XML
+      </button>
+      {inspection && (
+        <>
+          <p className="form-hint">
+            {inspection.vouchers.length} supported vouchers · {inspection.ledgers.length} ledgers.
+            Explicitly map every source ledger.
+          </p>
+          <div className="business-grid">
+            {inspection.ledgers.map((name) => (
+              <AccountSelect
+                key={name}
+                accounts={state.accounts}
+                kinds={['asset', 'liability', 'equity', 'income', 'expense']}
+                value={maps[name] || 0}
+                change={(id) => {
+                  setMaps((p) => ({ ...p, [name]: id }));
+                  setPreview(null);
+                }}
+                label={`Map Tally ledger: ${name}`}
+              />
+            ))}
+            <Field name="Stable source company ID">
+              <input
+                required
+                maxLength={30}
+                value={source}
+                onChange={(e) => {
+                  setSource(e.target.value);
+                  setPreview(null);
+                }}
+              />
+            </Field>
+          </div>
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={confirmed}
+              onChange={(e) => setConfirmed(e.target.checked)}
+            />
+            I confirmed the source and destination books use INR.
+          </label>
+          <div className="business-actions">
+            <button
+              className="button secondary"
+              disabled={busy || !confirmed || !source || inspection.ledgers.some((l) => !maps[l])}
+              onClick={async () => {
+                try {
+                  setPreview(await request('import_tally', payload));
+                } catch (e) {
+                  onError(err(e));
+                }
+              }}
+            >
+              Preview mapped Tally import
+            </button>
+            {preview && (
+              <>
+                <span>
+                  {preview.count} vouchers validated · Trial balance{' '}
+                  {money(preview.trial_balance.debit_minor, 'INR')} /{' '}
+                  {money(preview.trial_balance.credit_minor, 'INR')}
+                </span>
+                <button
+                  className="button primary"
+                  disabled={busy || !confirmed}
+                  onClick={async () => {
+                    if (
+                      await mutate(
+                        'import_tally',
+                        { ...payload, preview: false },
+                        'Tally general vouchers imported.',
+                      )
+                    ) {
+                      setPreview(null);
+                      setInspection(null);
+                      setContents('');
+                    }
+                  }}
+                >
+                  Import mapped Tally vouchers
+                </button>
+              </>
+            )}
+          </div>
+        </>
+      )}
+    </section>
+  );
 }

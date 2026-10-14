@@ -66,7 +66,12 @@ try {
   );
   session = created.sessionId;
   await poll(async () => {
-    assert.equal(await script('return Boolean(window.__TAURI__?.core)'), true);
+    assert.equal(
+      await script(
+        "return Boolean(window.__TAURI__?.core) && location.href !== 'about:blank' && document.querySelector('h2')?.textContent === 'Create your company'",
+      ),
+      true,
+    );
   });
   await invoke('create_company', {
     name: 'Native smoke books',

@@ -10,7 +10,7 @@ A service sale for 1,000.00 debits receivables 1,000.00 and credits sales income
 
 Amounts are positive decimal strings, with at most two fractional digits. Invoice quantities have up to three fractional digits. A line extension rounds half up to the nearest minor unit; invoice totals sum the rounded extensions. Document and journal writes, numbering, and stock changes share one SQLite transaction. A request identifier with the same payload retries the original result; reusing it with a different payload is rejected. Receipts cannot exceed the outstanding amount, precede their invoice, or precede the latest settlement/reversal for that invoice.
 
-Due dates cannot precede invoice dates. Balances as of a date include only documents and reversals effective by that date. Unpaid invoices become overdue after the due date. No tax, exchange-rate, or filing rules are inferred.
+Due dates cannot precede invoice dates. Balances as of a date include only documents and reversals effective by that date. Unpaid invoices become overdue after the due date. Tax rates and eligibility are not inferred. Optional supported India GST is specified separately in [INDIA_GST.md](INDIA_GST.md); exchange rates and statutory filing remain unsupported.
 
 Drafts are saved explicitly on this device, separately from the accounting database. Drafts are not included in backups. Review displays the document before posting. Posted documents cannot be edited. Service invoice reversals require linked settlements to be reversed first and cannot precede those reversals. View the document's Journal to reverse it.
 
