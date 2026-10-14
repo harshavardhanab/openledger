@@ -576,6 +576,7 @@ function DocumentComposer({
   data,
   busy,
   mutate,
+  onError,
 }: Props & { data: Business; kind: string; invoice: Doc | null; close: () => void }) {
   const settlement = kind === 'receipt' || kind === 'payment',
     stock = kind === 'stock';
@@ -655,7 +656,11 @@ function DocumentComposer({
   const currency = state.company!.currency;
   const draftKey = `open-ledger-draft:${state.company!.created_at}:${state.company!.name}:${kind}`;
   const saveDraft = () => {
-    localStorage.setItem(draftKey, JSON.stringify(payload));
+    try {
+      localStorage.setItem(draftKey, JSON.stringify(payload));
+    } catch (e) {
+      onError(`Draft could not be saved on this device: ${err(e)}`);
+    }
   };
   const loadDraft = () => {
     try {
@@ -746,7 +751,11 @@ function DocumentComposer({
               disabled={busy}
               onClick={async () => {
                 if (await mutate('post_document', payload, 'Document posted.')) {
-                  localStorage.removeItem(draftKey);
+                  try {
+                    localStorage.removeItem(draftKey);
+                  } catch {
+                    // The posted document is durable even if optional draft storage is unavailable.
+                  }
                   close();
                 }
               }}

@@ -57,6 +57,24 @@ test('invalid native locales and unavailable preference storage preserve access 
   await expect(page.locator('.metric').first()).toContainText('₹0.00');
   await nav(page, 'Company & periods');
   await expect(page.getByLabel('Number and date locale')).toHaveValue('en-IN');
+  await api(request, 'create_party', {
+    name: 'No-storage customer',
+    kind: 'customer',
+    contact: '',
+    account_id: 3,
+  });
+  await nav(page, 'Invoices & settlements');
+  await page.getByRole('button', { name: 'New sales invoice' }).click();
+  await page.getByLabel('Customer', { exact: true }).selectOption({ label: 'No-storage customer' });
+  await page.getByLabel('Description', { exact: true }).fill('Works without browser storage');
+  await page.getByLabel('Unit price', { exact: true }).fill('10');
+  await page.getByLabel('Posting account').selectOption('7');
+  await page.getByRole('button', { name: 'Save draft on this device' }).click();
+  await expect(page.getByRole('alert').last()).toContainText('Draft could not be saved');
+  await page.getByRole('button', { name: 'Review document' }).click();
+  await page.getByRole('button', { name: 'Post sales invoice' }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'INV-000001', exact: true })).toBeVisible();
 });
 
 test('customer invoice and partial receipt through the interface', async ({ page, request }) => {
