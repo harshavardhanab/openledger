@@ -8,6 +8,8 @@ Open Ledger remains a prerelease until the remaining release gates in ROADMAP.md
 
 `package.yml` produces development artifacts and SHA-256 checksums. Its macOS signature is ad hoc. These artifacts must not be represented as trusted stable releases. CI run conclusions and downloaded packages must be checked for the exact source commit before claiming platform validation.
 
+`native-packages.yml` installs the Windows NSIS and Debian packages and runs the native smoke tests against their installed executables. Dispatch `build.yml` with a `package_run_id` to use it without rebuilding. The test verifies that the package run succeeded, its commit is an ancestor of the test ref, and all application/dependency source remains identical. Diagnostics include a screenshot and page/locale details on failure. Linux Xvfb tests use software rendering; this does not establish coverage of every GPU/desktop environment. macOS installed-package and dialog checks remain manual.
+
 ## Trusted candidates
 
 `trusted-release.yml` is manual and uses the protected `release-signing` GitHub environment. Configure that environment to permit only reviewed release refs and require maintainer approval. This configuration must be made in GitHub; declaring an environment in YAML does not enable those protections. The workflow uploads candidates and does not publish a release.

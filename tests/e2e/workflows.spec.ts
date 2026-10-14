@@ -29,6 +29,36 @@ async function journal(request: APIRequestContext, key: string, amount = '100') 
   });
 }
 
+test('invalid native locales and unavailable preference storage preserve access to books', async ({
+  page,
+  request,
+}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'language', { get: () => 'C' });
+    try {
+      localStorage.setItem('open-ledger-locale', 'C.UTF-8');
+    } catch {
+      // A later part of this test intentionally disables optional storage.
+    }
+  });
+  await company(page, request, 'POSIX locale regression');
+  await expect(page.locator('.metric').first()).toContainText('₹0.00');
+  await nav(page, 'Company & periods');
+  await expect(page.getByLabel('Number and date locale')).toHaveValue('en-IN');
+  await page.addInitScript(() => {
+    Object.defineProperty(window, 'localStorage', {
+      get: () => {
+        throw new DOMException('Storage unavailable', 'SecurityError');
+      },
+    });
+  });
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
+  await expect(page.locator('.metric').first()).toContainText('₹0.00');
+  await nav(page, 'Company & periods');
+  await expect(page.getByLabel('Number and date locale')).toHaveValue('en-IN');
+});
+
 test('customer invoice and partial receipt through the interface', async ({ page, request }) => {
   await company(page, request, 'Invoice UI');
   await nav(page, 'Invoices & settlements');

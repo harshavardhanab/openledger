@@ -107,10 +107,28 @@ export function parseMinor(text: string): bigint | null {
 export function decimal(value: bigint): string {
   return `${value / 100n}.${String(value % 100n).padStart(2, '0')}`;
 }
+export function displayLocale(): string {
+  let preference: string | null = null;
+  try {
+    preference = localStorage.getItem('open-ledger-locale');
+  } catch {
+    // Optional display preferences must not prevent access to the books.
+  }
+  for (const candidate of [preference, navigator.language, 'en-IN']) {
+    if (!candidate) continue;
+    try {
+      const [locale] = Intl.getCanonicalLocales(candidate);
+      if (locale && Intl.NumberFormat.supportedLocalesOf([locale]).length) return locale;
+    } catch {
+      // Some native environments report POSIX values such as C or C.UTF-8.
+    }
+  }
+  return 'en-IN';
+}
 export function money(value: string | bigint, currency: string, symbol = true): string {
   const amount = BigInt(value);
   const absolute = amount < 0n ? -amount : amount;
-  const locale = localStorage.getItem('open-ledger-locale') || navigator.language;
+  const locale = displayLocale();
   const parts = new Intl.NumberFormat(locale, {
     style: 'currency',
     currency,
@@ -125,14 +143,11 @@ export function money(value: string | bigint, currency: string, symbol = true): 
   return `${amount < 0n ? '−' : ''}${rendered}`;
 }
 export function displayDate(value: string): string {
-  return new Date(`${value}T12:00:00`).toLocaleDateString(
-    localStorage.getItem('open-ledger-locale') || navigator.language,
-    {
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric',
-    },
-  );
+  return new Date(`${value}T12:00:00`).toLocaleDateString(displayLocale(), {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  });
 }
 export async function download(name: string, contents: string, type = 'application/json') {
   if (desktop()) {

@@ -7,6 +7,7 @@ import {
   csv,
   decimal,
   displayDate,
+  displayLocale,
   download,
   money,
   parseMinor,
@@ -1870,14 +1871,18 @@ function Settings(props: Props & { data: Business }) {
         <h3>Display preferences</h3>
         <Field name="Number and date locale">
           <select
-            defaultValue={localStorage.getItem('open-ledger-locale') || navigator.language}
+            defaultValue={displayLocale()}
             onChange={(e) => {
-              localStorage.setItem('open-ledger-locale', e.target.value);
-              window.location.reload();
+              try {
+                localStorage.setItem('open-ledger-locale', e.target.value);
+                window.location.reload();
+              } catch (e) {
+                onError(err(e));
+              }
             }}
           >
             {Array.from(
-              new Set([navigator.language, 'en-IN', 'en-GB', 'en-US', 'de-DE', 'fr-FR']),
+              new Set([displayLocale(), 'en-IN', 'en-GB', 'en-US', 'de-DE', 'fr-FR']),
             ).map((l) => (
               <option key={l} value={l}>
                 {l}

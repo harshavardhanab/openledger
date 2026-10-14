@@ -62,10 +62,10 @@ jobs:
         shell: pwsh
         run: |
           $installer = (Get-ChildItem packages/*setup.exe).FullName
-          $installPath = "$env:RUNNER_TEMP/open-ledger-installed"
+          $installPath = Join-Path $env:RUNNER_TEMP 'open-ledger-installed'
           $process = Start-Process -FilePath $installer -ArgumentList '/S',"/D=$installPath" -PassThru -Wait
           if ($process.ExitCode -ne 0) { throw 'Installer failed' }
-          Get-ChildItem $installPath -Recurse | Select-Object FullName
+          Get-ChildItem $installPath -Recurse | ForEach-Object { Write-Host $_.FullName }
           $binaries = @(Get-ChildItem $installPath -Recurse -File | Where-Object { $_.Name -in @('open-ledger-desktop.exe', 'Open Ledger.exe') })
           if ($binaries.Count -ne 1) { throw 'Expected exactly one installed application executable' }
           $binary = $binaries[0].FullName
