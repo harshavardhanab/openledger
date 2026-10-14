@@ -4,13 +4,25 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      package_run_id:
+        description: Optional successful package run ID to test installed packages without rebuilding
+        required: false
+        type: string
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: checks-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  installed:
+    if: inputs.package_run_id != ''
+    uses: ./.github/workflows/native-packages.yml
+    with:
+      package_run_id: ${{ inputs.package_run_id }}
   build:
+    if: inputs.package_run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +65,11 @@ jobs:
           "$env:RUNNER_TEMP/edgedriver" | Out-File -FilePath $env:GITHUB_PATH -Append
       - name: Native desktop smoke tests (Linux)
         if: runner.os == 'Linux'
+        # Xvfb has no GPU. See https://v2.tauri.app/develop/debug/linux-graphics/
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          WEBKIT_DISABLE_DMABUF_RENDERER: '1'
+          WEBKIT_DISABLE_COMPOSITING_MODE: '1'
         run: xvfb-run -a npm run test:desktop
       - name: Native desktop smoke tests (Windows)
         if: runner.os == 'Windows'

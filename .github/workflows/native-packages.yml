@@ -1,0 +1,92 @@
+name: Test installed desktop packages
+on:
+  workflow_call:
+    inputs:
+      package_run_id:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      package_run_id:
+        description: Successful package.yml run ID for the same application source
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.1'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify package provenance and application source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_RUN_ID: ${{ inputs.package_run_id }}
+        run: |
+          [[ "$PACKAGE_RUN_ID" =~ ^[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PACKAGE_RUN_ID" > "$RUNNER_TEMP/package-run.json"
+          node --input-type=module -e 'import fs from "node:fs"; const r=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); if(r.conclusion!=="success" || r.path!==".github/workflows/package.yml") throw new Error("Require a successful package.yml run"); fs.writeFileSync(process.argv[2],r.head_sha)' "$RUNNER_TEMP/package-run.json" "$RUNNER_TEMP/package-sha"
+          sha=$(cat "$RUNNER_TEMP/package-sha")
+          git merge-base --is-ancestor "$sha" HEAD
+          git diff --exit-code "$sha" HEAD -- crates src src-tauri Cargo.toml Cargo.lock package.json package-lock.json
+          echo "Testing installed packages built from $sha" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/download-artifact@v4
+        with:
+          name: open-ledger-${{ runner.os }}-X64
+          run-id: ${{ inputs.package_run_id }}
+          github-token: ${{ github.token }}
+          path: packages
+      - name: Verify package checksums
+        shell: bash
+        run: cd packages && sha256sum --check SHA256SUMS
+      - name: Install Linux package and WebDriver dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ./packages/*.deb webkit2gtk-driver xvfb
+          echo 'OPEN_LEDGER_BINARY=/usr/bin/open-ledger-desktop' >> "$GITHUB_ENV"
+      - name: Install Windows package and matching WebDriver
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = (Get-ChildItem packages/*setup.exe).FullName
+          $installPath = "$env:RUNNER_TEMP/open-ledger-installed"
+          $process = Start-Process -FilePath $installer -ArgumentList '/S',"/D=$installPath" -PassThru -Wait
+          if ($process.ExitCode -ne 0) { throw 'Installer failed' }
+          $binary = Join-Path $installPath 'open-ledger-desktop.exe'
+          if (!(Test-Path $binary)) { throw 'Installed executable is missing' }
+          "OPEN_LEDGER_BINARY=$binary" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+          $version = (Get-Item $edge).VersionInfo.ProductVersion
+          Invoke-WebRequest "https://msedgedriver.microsoft.com/$version/edgedriver_win64.zip" -OutFile "$env:RUNNER_TEMP/driver.zip"
+          Expand-Archive "$env:RUNNER_TEMP/driver.zip" -DestinationPath "$env:RUNNER_TEMP/edgedriver"
+          "$env:RUNNER_TEMP/edgedriver" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - run: cargo install tauri-driver --locked
+      - name: Native installed-package smoke (Linux)
+        if: runner.os == 'Linux'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          WEBKIT_DISABLE_DMABUF_RENDERER: '1'
+          WEBKIT_DISABLE_COMPOSITING_MODE: '1'
+        run: xvfb-run -a node scripts/desktop-smoke.mjs
+      - name: Native installed-package smoke (Windows)
+        if: runner.os == 'Windows'
+        run: node scripts/desktop-smoke.mjs
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: native-failure-${{ runner.os }}
+          path: test-results/
+          if-no-files-found: ignore

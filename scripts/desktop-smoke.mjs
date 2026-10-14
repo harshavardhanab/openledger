@@ -1,6 +1,6 @@
 // Native WebDriver smoke tests. Run against an already-built executable on Linux/Windows.
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import assert from 'node:assert/strict';
@@ -88,7 +88,7 @@ try {
       { account_id: 6, side: 'credit', amount: '1000' },
     ],
   });
-  await script('window.location.reload();return true');
+  await send(`/session/${session}/refresh`, 'POST', {});
   await poll(async () => {
     assert.equal(await script('return document.querySelector("h1")?.textContent'), 'Overview');
   });
@@ -124,6 +124,19 @@ try {
   console.log(
     'Native IPC, rendered reports, posting, reversal, backup, restore, and malformed restore checks passed.',
   );
+} catch (error) {
+  if (session) {
+    const diagnostics = await script(
+      'return {url:location.href,title:document.title,body:document.body?.innerText}',
+    ).catch((e) => ({ error: String(e) }));
+    console.error('Native page diagnostics:', JSON.stringify(diagnostics));
+    const screenshot = await send(`/session/${session}/screenshot`, 'GET').catch(() => null);
+    if (typeof screenshot === 'string') {
+      await mkdir('test-results', { recursive: true });
+      await writeFile('test-results/native.png', Buffer.from(screenshot, 'base64'));
+    }
+  }
+  throw error;
 } finally {
   if (session) await send(`/session/${session}`, 'DELETE').catch(() => {});
   driver.kill();
