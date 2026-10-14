@@ -1,0 +1,16 @@
+name: Feature request
+description: Propose a scoped accounting or usability improvement.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or accounting workflow
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior and example
+      description: Explain the expected accounting result using fictional amounts.
+    validations:
+      required: true

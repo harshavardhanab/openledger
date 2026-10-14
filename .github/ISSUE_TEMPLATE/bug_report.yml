@@ -1,0 +1,22 @@
+name: Bug report
+description: Report a reproducible problem using fictional data.
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Use fictional records. Do not upload private databases or backups.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Version or commit, operating system, and desktop or browser mode
+    validations:
+      required: true
