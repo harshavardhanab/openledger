@@ -1,0 +1,15 @@
+/target/
+/node_modules/
+/dist/
+/src-tauri/gen/
+/.data/
+*.sqlite*
+*.db*
+.DS_Store
+
+# Local research, decompilation, original binaries, logs and build artifacts.
+# Dot folders remain visible on GitHub if tracked; this directory stays local.
+/.research/
+/artifacts/
+/recovery-backups/
+*.log

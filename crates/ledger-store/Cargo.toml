@@ -1,0 +1,15 @@
+[package]
+name = "ledger-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ledger-core = { path = "../ledger-core" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+rusqlite.workspace = true
+tempfile.workspace = true
