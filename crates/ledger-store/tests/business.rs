@@ -324,6 +324,47 @@ fn supplier_refund_reduces_bank_outflow_and_v3_backups_keep_retry_identity() {
     restore(&upgraded);
 }
 #[test]
+fn rounded_fractional_credit_never_strands_the_final_stock_quantity() {
+    let mut s = books();
+    let p = party(&mut s, "supplier");
+    let item = inventory(&mut s);
+    let mut input = invoice("purchase", p.id, "tiny-purchase", "0.01");
+    input.lines[0].quantity = "3".into();
+    input.lines[0].item_id = Some(item.id);
+    input.lines[0].account_id = item.input.asset_account_id;
+    let d = s.post_document(input).unwrap();
+    let partial = s
+        .post_document(return_note(&d, "fractional-credit", "2.6"))
+        .unwrap();
+    assert_eq!(partial.total_minor, "2");
+    let remaining = s.business_state(0, 50, None).unwrap();
+    assert_eq!(remaining.stock[0].quantity_milli, "400");
+    assert_eq!(
+        remaining
+            .documents
+            .iter()
+            .find(|v| v.document.id == d.id)
+            .unwrap()
+            .outstanding_minor,
+        "1"
+    );
+    let last = s
+        .post_document(return_note(&d, "last-credit", "0.4"))
+        .unwrap();
+    assert_eq!(last.total_minor, "1");
+    let b = s.business_state(0, 50, None).unwrap();
+    assert_eq!(b.stock[0].quantity_milli, "0");
+    assert_eq!(b.stock[0].value_minor, "0");
+    assert_eq!(
+        s.ledger(item.input.expense_account_id, None, None)
+            .unwrap()
+            .closing_minor,
+        "0"
+    );
+    assert_eq!(s.ledger(5, None, None).unwrap().closing_minor, "0");
+    restore(&s);
+}
+#[test]
 fn sales_partial_receipts_reversals_and_asof_outstandings_agree() {
     let mut s = books();
     let p = party(&mut s, "customer");

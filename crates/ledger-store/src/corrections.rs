@@ -85,9 +85,17 @@ fn quantities(conn: &Connection, invoice: i64) -> Result<BTreeMap<usize, i64>> {
     }
     Ok(used)
 }
-fn proportional(n: i64, prior: i64, qty: i64, whole: i64) -> Result<i64> {
-    let round =
-        |q: i64| (i128::from(n) * i128::from(q) + i128::from(whole) / 2) / i128::from(whole);
+fn proportional(n: i64, prior: i64, qty: i64, whole: i64, reserve_tail: bool) -> Result<i64> {
+    let round = |q: i64| {
+        let rounded = (i128::from(n) * i128::from(q) + i128::from(whole) / 2) / i128::from(whole);
+        // Preserve a final minor unit while quantity remains. Otherwise an early
+        // rounded credit can strand an unpostable zero-value physical return.
+        if reserve_tail && q < whole && n > 0 {
+            rounded.min(i128::from(n - 1))
+        } else {
+            rounded
+        }
+    };
     i64::try_from(round(prior + qty) - round(prior))
         .map_err(|_| invalid("Return amount exceeds range."))
 }
@@ -196,7 +204,7 @@ pub(crate) fn prepare_correction(
             )
             .map_err(|_| invalid("Amount exceeds range."))?
         };
-        let credit = proportional(base, prior, qty, whole)?;
+        let credit = proportional(base, prior, qty, whole, true)?;
         gross += i128::from(credit);
         let mut cost = 0;
         if let Some(item) = l.item_id {
@@ -222,7 +230,7 @@ pub(crate) fn prepare_correction(
                     params![invoice, item],
                     |r| r.get(0),
                 )?;
-                cost = proportional(issue, prior, qty, whole)?;
+                cost = proportional(issue, prior, qty, whole, false)?;
                 available
                     .checked_add(qty)
                     .ok_or_else(|| invalid("Stock quantity exceeds range."))?;
@@ -277,7 +285,7 @@ pub(crate) fn prepare_correction(
                 .iter()
                 .enumerate()
             {
-                values[i + 1] = proportional(minor(n)?, prior, qty, whole)?;
+                values[i + 1] = proportional(minor(n)?, prior, qty, whole, true)?;
                 gross += i128::from(values[i + 1]);
             }
             for i in 0..4 {

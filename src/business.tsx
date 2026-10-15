@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useId } from 'react';
+import React, { useEffect, useState, useId, useRef } from 'react';
 import {
   Account,
   Journal,
@@ -690,12 +690,24 @@ function ReturnComposer({
     [reason, setReason] = useState('');
   const [working, setWorking] = useState(false);
   const [taxReviewed, setTaxReviewed] = useState(false);
+  const heading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    return () => {
+      if (previous?.isConnected) previous.focus();
+    };
+  }, []);
+
   const [review, setReview] = useState<{
     document: Doc;
     journal: Journal;
     payload: DocInput;
   } | null>(null);
   const [requestId, setRequestId] = useState(() => crypto.randomUUID());
+  useEffect(() => {
+    heading.current?.focus();
+  }, [Boolean(review)]);
+
   useEffect(() => {
     let active = true;
     request<{ invoice: Doc; remaining_milli: string[] }>('returnable_invoice', { id: invoice.id })
@@ -720,7 +732,9 @@ function ReturnComposer({
   return (
     <section className="panel business-card" aria-label="Invoice return">
       <div className="panel-title">
-        <h2>Return / cancel {invoice.number}</h2>
+        <h2 ref={heading} tabIndex={-1}>
+          Return / cancel {invoice.number}
+        </h2>
         <button className="button secondary" disabled={busy || working} onClick={close}>
           Close return
         </button>

@@ -32,7 +32,7 @@ async function journal(request: APIRequestContext, key: string, amount = '100') 
 test('linked invoice cancellation, reviewed return and customer refund work through the interface', async ({
   page,
   request,
-}) => {
+}, testInfo) => {
   await company(page, request, 'Returns UI');
   const party = await api(request, 'create_party', {
     name: 'Return customer',
@@ -80,7 +80,18 @@ test('linked invoice cancellation, reviewed return and customer refund work thro
   await page.getByRole('button', { name: 'Review return', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Review sales credit note' })).toBeVisible();
   await expect(page.getByLabel('Invoice return')).toContainText('₹300.00');
-  await page.getByRole('button', { name: 'Post return note', exact: true }).click();
+  await expect(
+    page.getByRole('heading', { name: 'Return / cancel INV-000001', exact: true }),
+  ).toBeFocused();
+  // Safari on macOS follows the system's keyboard-navigation preference;
+  // Option-Tab includes buttons when ordinary Tab is restricted to fields.
+  const nextControl =
+    testInfo.project.name === 'webkit' && process.platform === 'darwin' ? 'Alt+Tab' : 'Tab';
+  await page.keyboard.press(nextControl);
+  await page.keyboard.press(nextControl);
+  await page.keyboard.press(nextControl);
+  await expect(page.getByRole('button', { name: 'Post return note', exact: true })).toBeFocused();
+  await page.keyboard.press('Enter');
   await expect(page.getByRole('button', { name: 'CN-000001', exact: true })).toBeVisible();
   const row = page
     .getByRole('row')
