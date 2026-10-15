@@ -130,6 +130,16 @@ impl LedgerService {
             "create_item" => {
                 serde_json::to_value(store.create_item(serde_json::from_value(payload)?)?)?
             }
+            "returnable_invoice" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Query {
+                    id: i64,
+                }
+                let q: Query = serde_json::from_value(payload)?;
+                store.returnable_invoice(q.id)?
+            }
+            "preview_document" => store.preview_document(serde_json::from_value(payload)?)?,
             "post_document" => {
                 serde_json::to_value(store.post_document(serde_json::from_value(payload)?)?)?
             }

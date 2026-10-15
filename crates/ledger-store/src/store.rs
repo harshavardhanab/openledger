@@ -184,7 +184,7 @@ impl LedgerStore {
         conn.busy_timeout(Duration::from_secs(5))?;
         let app_id: i64 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if app_id != 1330399058 || !(1..=3).contains(&version) {
+        if app_id != 1330399058 || !(1..=4).contains(&version) {
             return Err(invalid(
                 "Books file is unsupported or belongs to another application.",
             ));
@@ -202,7 +202,7 @@ impl LedgerStore {
         if app_id != 0 && app_id != 1330399058 {
             return Err(invalid("This file belongs to a different application."));
         }
-        if version > 3 {
+        if version > 4 {
             return Err(invalid(
                 "This database needs a newer version of Open Ledger.",
             ));
@@ -221,6 +221,29 @@ impl LedgerStore {
         }
         if version < 3 {
             conn.execute_batch(include_str!("migration_v3.sql"))?;
+        }
+        if version < 4 {
+            // SQLite's documented table rebuild procedure preserves child foreign keys.
+            // Disable FK enforcement outside the transaction; validate before committing.
+            conn.pragma_update(None, "foreign_keys", false)?;
+            let result = (|| -> Result<()> {
+                conn.execute_batch("BEGIN IMMEDIATE")?;
+                conn.execute_batch(include_str!("migration_v4.sql"))?;
+                let broken: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                        r.get(0)
+                    })?;
+                if broken != 0 {
+                    return Err(invalid("Schema migration found broken references."));
+                }
+                conn.execute_batch("COMMIT")?;
+                Ok(())
+            })();
+            if result.is_err() && !conn.is_autocommit() {
+                conn.execute_batch("ROLLBACK")?;
+            }
+            conn.pragma_update(None, "foreign_keys", true)?;
+            result?;
         }
         if wal {
             conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -645,7 +668,7 @@ impl LedgerStore {
         }
         Ok(serde_json::to_string_pretty(&Backup {
             format: "open-ledger-backup".into(),
-            version: 3,
+            version: 4,
             exported_at: now(),
             company,
             accounts,
@@ -669,7 +692,7 @@ impl LedgerStore {
             ));
         }
         let mut backup: Backup = serde_json::from_value(raw)?;
-        if backup.format != "open-ledger-backup" || !(1..=3).contains(&backup.version) {
+        if backup.format != "open-ledger-backup" || !(1..=4).contains(&backup.version) {
             return Err(invalid("This is not a supported Open Ledger backup."));
         }
         if backup.version == 1 && !backup.business.is_empty() {
@@ -686,6 +709,37 @@ impl LedgerStore {
                     .any(|d| d.gst.is_some() || d.input.gst.is_some()))
         {
             return Err(invalid("GST records require backup version 3."));
+        }
+        if backup.version < 4
+            && (backup.business.numbering.iter().any(|n| {
+                [
+                    "credit_note",
+                    "debit_note",
+                    "customer_refund",
+                    "supplier_refund",
+                ]
+                .contains(&n.kind.as_str())
+            }) || backup.business.documents.iter().any(|d| {
+                d.correction.is_some()
+                    || d.input.gst_adjustment_reviewed.is_some()
+                    || d.input.return_lines.is_some()
+                    || d.input.reviewed_postings.is_some()
+                    || [
+                        "credit_note",
+                        "debit_note",
+                        "customer_refund",
+                        "supplier_refund",
+                    ]
+                    .contains(&d.input.kind.as_str())
+            }))
+        {
+            return Err(invalid("Returns and refunds require backup version 4."));
+        }
+        if backup.version == 4
+            && !backup.business.is_empty()
+            && backup.business.numbering.len() != 10
+        {
+            return Err(invalid("Version 4 requires all ten numbering sequences."));
         }
         chrono::DateTime::parse_from_rfc3339(&backup.exported_at)
             .map_err(|_| invalid("The backup date is invalid."))?;

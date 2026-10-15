@@ -10,6 +10,7 @@ A free, open-source, local accounting application written in Rust, React, and Ta
 - Inspect account ledgers with date ranges and opening/closing balances.
 - View trial balances as of a chosen date and export reports to CSV.
 - Create customers/suppliers, post sales/purchase invoices, record linked partial receipts/payments, and inspect outstanding balances.
+- Post linked partial/full invoice returns, cancel remaining quantities, and refund customer/supplier credits with stock and GST adjustments. See [returns and refunds](docs/RETURNS.md).
 - Configure document numbering, save local drafts, export HTML documents, and print to PDF.
 - Calculate scoped domestic regular India GST (CGST, SGST/UTGST or IGST), post reviewed input credits, and export a GST accounting register. See [India GST scope](docs/INDIA_GST.md).
 - Track fractional inventory units, stock adjustments and movement history with perpetual weighted average costing.
@@ -19,7 +20,7 @@ A free, open-source, local accounting application written in Rust, React, and Ta
 
 Amounts use exact integer minor units in Rust and strings/BigInt in the interface. Supported currencies are INR, USD, EUR, GBP, CAD, and AUD, each using two decimal places. Journal amounts must fit a signed 64-bit integer; accumulated reports use 128-bit arithmetic. Posted records have database guards against editing and deletion. Repeated posting requests are idempotent.
 
-Statutory GST filing and special tax regimes, verified Tally data import, payroll, multi-user access, and mobile packaging remain unimplemented. Inventory invoice cancellation/credit-note workflows and statement reopening also remain follow-ups; separate stock journals cannot be reversed. Lists have pagination; reports and backups include full history. The general accounting rules, examples, and correction limits are documented in [docs/ACCOUNTING.md](docs/ACCOUNTING.md).
+Statutory GST filing and special tax regimes, verified Tally data import, payroll, multi-user access, and mobile packaging remain unimplemented. Statement reopening remains a follow-up; inventory and linked return journals cannot be reversed independently. Lists have pagination; reports and backups include full history. The general accounting rules, examples, and correction limits are documented in [docs/ACCOUNTING.md](docs/ACCOUNTING.md).
 
 ## Run the desktop app
 

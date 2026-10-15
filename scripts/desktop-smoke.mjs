@@ -122,8 +122,77 @@ try {
   });
   assert.equal(failed, true);
   assert.equal((await invoke('state')).journal_count, 1);
+  const customer = await invoke('create_party', {
+    name: 'Native return customer',
+    kind: 'customer',
+    contact: '',
+    account_id: 3,
+  });
+  const invoiceInput = {
+    kind: 'sale',
+    date: '2026-10-01',
+    due_date: '2026-10-02',
+    party_id: customer.id,
+    invoice_id: null,
+    money_account_id: null,
+    amount: null,
+    note: 'Native return source',
+    lines: [
+      { description: 'Service', quantity: '3', unit_price: '10', account_id: 7, item_id: null },
+    ],
+    request_id: 'native-invoice',
+  };
+  const invoice = await invoke('post_document', invoiceInput);
+  await invoke('post_document', {
+    ...invoiceInput,
+    kind: 'receipt',
+    date: '2026-10-02',
+    due_date: null,
+    invoice_id: invoice.id,
+    money_account_id: 2,
+    amount: '30',
+    lines: [],
+    request_id: 'native-receipt',
+  });
+  const note = {
+    ...invoiceInput,
+    kind: 'credit_note',
+    date: '2026-10-03',
+    due_date: null,
+    invoice_id: invoice.id,
+    lines: [],
+    return_lines: [{ line: 0, quantity: '3' }],
+    request_id: 'native-return',
+    note: 'Full native cancellation',
+  };
+  const returnPreview = await invoke('preview_document', note);
+  assert.equal(returnPreview.document.total_minor, '3000');
+  assert.equal((await invoke('state')).journal_count, 3);
+  await invoke('post_document', note);
+  await invoke('post_document', {
+    ...invoiceInput,
+    kind: 'customer_refund',
+    date: '2026-10-03',
+    due_date: null,
+    invoice_id: invoice.id,
+    money_account_id: 2,
+    amount: '30',
+    lines: [],
+    request_id: 'native-refund',
+  });
+  assert.equal(
+    (await invoke('ledger', { account_id: 3, from: null, to: null })).closing_minor,
+    '0',
+  );
+  const returnsBackup = await invoke('backup');
+  await invoke('restore_backup', { contents: returnsBackup });
+  const business = await invoke('business', { offset: 0, limit: 50, as_of: null });
+  const returned = business.documents.find((d) => d.id === invoice.id);
+  assert.equal(returned.credited_minor, '3000');
+  assert.equal(returned.outstanding_minor, '0');
+  assert.equal((await invoke('returnable_invoice', { id: invoice.id })).remaining_milli[0], '0');
   console.log(
-    'Native IPC, rendered reports, posting, reversal, backup, restore, and malformed restore checks passed.',
+    'Native IPC, rendered reports, posting, reversal, backup, restore, malformed restore, linked return and refund checks passed.',
   );
 } catch (error) {
   if (session) {

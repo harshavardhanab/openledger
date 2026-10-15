@@ -234,6 +234,20 @@ function App() {
   const [selectedJournal, setSelectedJournal] = useState<Journal | null>(null);
   const [selectedAccount, setSelectedAccount] = useState(0);
   const [sidebar, setSidebar] = useState(false);
+  useEffect(() => {
+    document.getElementById('page-title')?.focus({ preventScroll: true });
+  }, [page]);
+  useEffect(() => {
+    if (!sidebar) return;
+    const closeNavigation = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setSidebar(false);
+        document.querySelector<HTMLButtonElement>('.mobile-menu')?.focus();
+      }
+    };
+    window.addEventListener('keydown', closeNavigation);
+    return () => window.removeEventListener('keydown', closeNavigation);
+  }, [sidebar]);
   const reload = async () => {
     try {
       setState(await request<Snapshot>('state'));
@@ -337,7 +351,10 @@ function App() {
   return (
     <ErrorContext.Provider value={error}>
       <div className="app-shell">
-        <aside className={`sidebar ${sidebar ? 'open' : ''}`}>
+        <a className="skip-link" href="#main-content">
+          Skip to main content
+        </a>
+        <aside id="workspace-navigation" className={`sidebar ${sidebar ? 'open' : ''}`}>
           <Brand />
           <div className="workspace">
             <span className="company-avatar">{state.company.name[0]?.toUpperCase()}</span>
@@ -347,7 +364,7 @@ function App() {
             </div>
           </div>
           <p className="nav-label">WORKSPACE</p>
-          <nav>
+          <nav aria-label="Workspace">
             {(
               [
                 'overview',
@@ -366,6 +383,7 @@ function App() {
               <button
                 key={item}
                 className={page === item ? 'active' : ''}
+                aria-current={page === item ? 'page' : undefined}
                 onClick={() => navigate(item)}
               >
                 <Icon name={item} />
@@ -399,12 +417,14 @@ function App() {
             <span className="version">OPEN LEDGER · 0.1</span>
           </div>
         </aside>
-        <main className="main">
+        <main className="main" id="main-content" tabIndex={-1}>
           <header className="topbar">
             <div>
               <button
                 className="icon-button mobile-menu"
                 aria-label="Toggle navigation"
+                aria-expanded={sidebar}
+                aria-controls="workspace-navigation"
                 onClick={() => setSidebar(!sidebar)}
               >
                 <Icon name="menu" />
@@ -422,7 +442,9 @@ function App() {
             <div className="page-heading">
               <div>
                 <p className="eyebrow">YOUR COMPANY BOOKS</p>
-                <h1>{titles[page][0]}</h1>
+                <h1 id="page-title" tabIndex={-1}>
+                  {titles[page][0]}
+                </h1>
                 <p>{titles[page][1]}</p>
               </div>
               <div className="heading-actions">
@@ -619,18 +641,16 @@ function Welcome({ busy, error, mutate }: { busy: boolean; error: string; mutate
           </div>
         </div>
         <small>OPEN LEDGER · BUILT FOR EVERYDAY BOOKKEEPING</small>
-        <div className="welcome-art">
+        <div className="welcome-art" aria-hidden="true">
           <div className="art-card">
-            <span>TRIAL BALANCE</span>
+            <Icon name="ledger" size={20} />
             <div>
               <i />
               <i />
               <i />
             </div>
             <hr />
-            <strong>
-              In balance <Icon name="check" size={16} />
-            </strong>
+            <Icon name="check" size={16} />
           </div>
           <span className="art-orbit" />
         </div>

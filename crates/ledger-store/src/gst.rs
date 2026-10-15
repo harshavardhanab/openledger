@@ -114,9 +114,12 @@ pub(crate) fn validate_gst_profile(tx: &Transaction<'_>, p: &GstProfile) -> Resu
     Ok(())
 }
 pub(crate) fn validate_gst_number(input: &DocumentInput, number: &str) -> Result<()> {
-    if input.gst.is_some() && input.kind == "sale" && !valid_invoice_number(number) {
+    if ((input.gst.is_some() && input.kind == "sale")
+        || ["credit_note", "debit_note"].contains(&input.kind.as_str()))
+        && !valid_invoice_number(number)
+    {
         return Err(invalid(
-            "A GST sales invoice number must be 1–16 alphanumeric, hyphen or slash characters. Adjust numbering.",
+            "A GST sales invoice or return note number must be 1–16 alphanumeric, hyphen or slash characters. Adjust numbering.",
         ));
     }
     Ok(())
@@ -304,7 +307,7 @@ impl LedgerStore {
         } else {
             None
         };
-        let mut q=self.conn.prepare("SELECT d.data,(SELECT r.date FROM journals r WHERE r.reversal_of=d.journal_id) FROM documents d WHERE d.kind IN ('sale','purchase') ORDER BY d.date,d.id")?;
+        let mut q=self.conn.prepare("SELECT d.data,(SELECT r.date FROM journals r WHERE r.reversal_of=d.journal_id) FROM documents d WHERE d.kind IN ('sale','purchase','credit_note','debit_note') ORDER BY d.date,d.id")?;
         let mut rows = vec![];
         let mut totals = std::collections::BTreeMap::<String, (i128, i128, i128, i128)>::new();
         for r in q.query_map([], |r| {
@@ -312,17 +315,37 @@ impl LedgerStore {
         })? {
             let (data, reversed) = r?;
             let d: crate::Document = serde_json::from_str(&data)?;
-            let (Some(g), Some(calc)) = (&d.input.gst, &d.gst) else {
+            let source: Option<crate::Document> = if d.correction.is_some() {
+                let raw: String = self.conn.query_row(
+                    "SELECT data FROM documents WHERE id=?1",
+                    [d.input.invoice_id],
+                    |r| r.get(0),
+                )?;
+                Some(serde_json::from_str(&raw)?)
+            } else {
+                None
+            };
+            let original = source.as_ref().unwrap_or(&d);
+            let (Some(g), Some(calc)) = (&original.input.gst, &d.gst) else {
                 continue;
             };
+            let direction = if d.correction.is_some() { -1i128 } else { 1 };
             for (date, sign, event) in [
-                (Some(d.input.date.as_str()), 1i128, "invoice"),
+                (
+                    Some(d.input.date.as_str()),
+                    direction,
+                    if d.correction.is_some() {
+                        "return_note"
+                    } else {
+                        "invoice"
+                    },
+                ),
                 (reversed.as_deref(), -1, "accounting_reversal"),
             ] {
                 let Some(date) = date.filter(|date| *date >= from && *date <= to) else {
                     continue;
                 };
-                let total = totals.entry(d.input.kind.clone()).or_default();
+                let total = totals.entry(original.input.kind.clone()).or_default();
                 total.0 += sign
                     * calc
                         .taxable_minor
@@ -343,7 +366,7 @@ impl LedgerStore {
                         .igst_minor
                         .parse::<i128>()
                         .map_err(|_| invalid("Invalid stored GST."))?;
-                rows.push(serde_json::json!({"document_id":d.id,"number":d.number,"supplier_reference":g.supplier_reference,"kind":d.input.kind,"date":date,"event":event,"sign":sign,"counterparty_gstin":g.counterparty_gstin,"supply_state":g.supply_state,"supply_state_name":g.supply_state_name,"amounts":calc}));
+                rows.push(serde_json::json!({"document_id":d.id,"number":d.number,"original_invoice":source.as_ref().map(|s| &s.number),"supplier_reference":g.supplier_reference,"kind":d.input.kind,"date":date,"event":event,"sign":sign,"counterparty_gstin":g.counterparty_gstin,"supply_state":g.supply_state,"supply_state_name":g.supply_state_name,"amounts":calc}));
             }
         }
         let totals=totals.into_iter().map(|(k,(b,c,s,i))|(k,serde_json::json!({"taxable_minor":b.to_string(),"cgst_minor":c.to_string(),"sgst_minor":s.to_string(),"igst_minor":i.to_string()}))).collect::<std::collections::BTreeMap<_,_>>();

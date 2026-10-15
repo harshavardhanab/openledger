@@ -112,3 +112,62 @@ fn failed_schema_migration_rolls_back_and_a_retry_succeeds() {
     drop(conn);
     LedgerStore::open(&path).unwrap();
 }
+#[test]
+fn return_schema_rebuild_rolls_back_atomically_and_preserves_child_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v3.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(include_str!("../src/schema.sql"))
+        .unwrap();
+    conn.execute_batch(include_str!("../src/migration_v2.sql"))
+        .unwrap();
+    conn.execute_batch(include_str!("../src/migration_v3.sql"))
+        .unwrap();
+    conn.execute_batch("CREATE TABLE documents_new(collision TEXT)")
+        .unwrap();
+    drop(conn);
+    assert!(LedgerStore::open(&path).is_err());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM numbering", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        6
+    );
+    conn.execute_batch("DROP TABLE documents_new").unwrap();
+    drop(conn);
+    drop(LedgerStore::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    let fk: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='stock_moves'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(fk.contains("REFERENCES documents(id)"));
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    let mut s = LedgerStore::open(&path).unwrap();
+    s.create_company(CompanyInput {
+        name: "Migrated".into(),
+        currency: "INR".into(),
+        fiscal_year_start: "2026-04-01".into(),
+    })
+    .unwrap();
+}

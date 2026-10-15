@@ -38,6 +38,9 @@ fn books() -> (LedgerStore, GstProfile, Party, Party) {
 }
 fn invoice(kind: &str, party: i64, key: &str, state: &str) -> DocumentInput {
     DocumentInput {
+        gst_adjustment_reviewed: None,
+        return_lines: None,
+        reviewed_postings: None,
         gst: Some(GstInput {
             supply_state: state.into(),
             supply_state_name: if state == "29" {
@@ -100,6 +103,9 @@ fn intrastate_sales_tax_is_a_liability_and_settlements_use_the_gross_amount() {
     );
     assert!(s.financial_statements(None, None).unwrap().balanced);
     let payment = DocumentInput {
+        gst_adjustment_reviewed: None,
+        return_lines: None,
+        reviewed_postings: None,
         gst: None,
         kind: "receipt".into(),
         date: "2026-10-02".into(),
@@ -256,6 +262,13 @@ fn schema_and_backup_v2_compatibility_survive_the_gst_upgrade() {
     s.post_document(d.clone()).unwrap();
     let mut backup: Value = serde_json::from_str(&s.export_backup().unwrap()).unwrap();
     backup["version"] = json!(2);
+    backup["business"]["numbering"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|n| {
+            ["sale", "purchase", "receipt", "payment", "stock", "close"]
+                .contains(&n["kind"].as_str().unwrap())
+        });
     let mut t = LedgerStore::memory().unwrap();
     t.restore(&backup.to_string()).unwrap();
     assert_eq!(t.post_document(d).unwrap().id, 1);
@@ -279,4 +292,67 @@ fn company_inventory_does_not_migrate_inactive_books() {
             .unwrap(),
         1
     );
+}
+#[test]
+fn linked_gst_returns_sum_to_original_components_and_register_uses_note_dates() {
+    let (mut s, _, c, _) = books();
+    let mut input = invoice("sale", c.id, "tiny-sale", "29");
+    input.lines[0].quantity = "3".into();
+    input.lines[0].unit_price = "0.03".into();
+    let sale = s.post_document(input).unwrap();
+    assert_eq!(sale.total_minor, "11"); // 9 taxable + 1 CGST + 1 SGST.
+    let unreviewed = serde_json::json!({"kind":"credit_note","date":"2026-10-03","due_date":null,"party_id":c.id,"invoice_id":sale.id,"money_account_id":null,"amount":null,"note":"Requires review","lines":[],"return_lines":[{"line":0,"quantity":"1"}],"request_id":"unreviewed"});
+    assert!(
+        s.post_document(serde_json::from_value(unreviewed).unwrap())
+            .is_err()
+    );
+    let mut totals = [0i64; 4];
+    for i in 0..3 {
+        let d = s
+            .post_document(DocumentInput {
+                gst_adjustment_reviewed: Some(true),
+                return_lines: Some(vec![ReturnLine {
+                    line: 0,
+                    quantity: "1".into(),
+                }]),
+                reviewed_postings: None,
+                gst: None,
+                kind: "credit_note".into(),
+                date: format!("2026-10-0{}", i + 3),
+                due_date: None,
+                party_id: Some(c.id),
+                invoice_id: Some(sale.id),
+                money_account_id: None,
+                amount: None,
+                note: "Cancellation of one unit".into(),
+                lines: vec![],
+                request_id: format!("note-{i}"),
+            })
+            .unwrap();
+        let g = d.gst.unwrap();
+        for (j, n) in [
+            &g.taxable_minor,
+            &g.cgst_minor,
+            &g.sgst_minor,
+            &g.igst_minor,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            totals[j] += n.parse::<i64>().unwrap();
+        }
+    }
+    assert_eq!(totals, [9, 1, 1, 0]);
+    assert_eq!(
+        s.gst_report("2026-10-01", "2026-10-05").unwrap()["totals"]["sale"]["taxable_minor"],
+        "0"
+    );
+    let report = s.gst_report("2026-10-03", "2026-10-05").unwrap();
+    assert_eq!(report["totals"]["sale"]["cgst_minor"], "-1");
+    assert_eq!(report["rows"][0]["event"], "return_note");
+    assert_eq!(report["rows"][0]["original_invoice"], sale.number);
+    assert_eq!(report["filing_ready"], false);
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&s.export_backup().unwrap()).unwrap();
+    assert_eq!(restored.ledger(3, None, None).unwrap().closing_minor, "0");
 }

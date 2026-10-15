@@ -23,6 +23,9 @@ fn party(s: &mut LedgerStore, kind: &str) -> Party {
 }
 fn invoice(kind: &str, pid: i64, key: &str, amount: &str) -> DocumentInput {
     DocumentInput {
+        gst_adjustment_reviewed: None,
+        return_lines: None,
+        reviewed_postings: None,
         gst: None,
         kind: kind.into(),
         date: "2026-10-01".into(),
@@ -44,6 +47,9 @@ fn invoice(kind: &str, pid: i64, key: &str, amount: &str) -> DocumentInput {
 }
 fn receipt(invoice: &Document, key: &str, amount: &str) -> DocumentInput {
     DocumentInput {
+        gst_adjustment_reviewed: None,
+        return_lines: None,
+        reviewed_postings: None,
         gst: None,
         kind: if invoice.input.kind == "sale" {
             "receipt"
@@ -87,6 +93,235 @@ fn restore(s: &LedgerStore) -> LedgerStore {
     let mut restored = LedgerStore::memory().unwrap();
     restored.restore(&backup).unwrap();
     restored
+}
+fn return_note(d: &Document, key: &str, quantity: &str) -> DocumentInput {
+    DocumentInput {
+        gst_adjustment_reviewed: None,
+        return_lines: Some(vec![ReturnLine {
+            line: 0,
+            quantity: quantity.into(),
+        }]),
+        reviewed_postings: None,
+        gst: None,
+        kind: if d.input.kind == "sale" {
+            "credit_note"
+        } else {
+            "debit_note"
+        }
+        .into(),
+        date: "2026-10-03".into(),
+        due_date: None,
+        party_id: d.input.party_id,
+        invoice_id: Some(d.id),
+        money_account_id: None,
+        amount: None,
+        note: "Returned goods or cancelled service".into(),
+        lines: vec![],
+        request_id: key.into(),
+    }
+}
+#[test]
+fn linked_partial_returns_refunds_and_asof_balances_agree() {
+    let mut s = books();
+    let p = party(&mut s, "customer");
+    let mut input = invoice("sale", p.id, "sale", "100");
+    input.lines[0].quantity = "3".into();
+    let d = s.post_document(input).unwrap();
+    let receipt = s.post_document(receipt(&d, "cash", "300")).unwrap();
+    let note = return_note(&d, "return", "1");
+    let preview = s.preview_document(note.clone()).unwrap();
+    assert_eq!(preview["document"]["total_minor"], "10000");
+    assert_eq!(s.snapshot().unwrap().journal_count, 2);
+    let cn = s.post_document(note.clone()).unwrap();
+    assert_eq!(s.post_document(note).unwrap().id, cn.id);
+    assert_eq!(
+        s.returnable_invoice(d.id).unwrap()["remaining_milli"][0],
+        "2000"
+    );
+    let view = |s: &LedgerStore, date| {
+        s.business_state(0, 50, date)
+            .unwrap()
+            .documents
+            .into_iter()
+            .find(|v| v.document.id == d.id)
+            .unwrap()
+    };
+    assert_eq!(view(&s, Some("2026-10-02")).outstanding_minor, "0");
+    assert_eq!(view(&s, None).outstanding_minor, "-10000");
+    assert_eq!(view(&s, None).credited_minor, "10000");
+    let mut refund = refund_input(&d, "refund", "101");
+    assert!(s.post_document(refund.clone()).is_err());
+    refund.amount = Some("100".into());
+    let refunded = s.post_document(refund).unwrap();
+    assert_eq!(view(&s, None).outstanding_minor, "0");
+    assert_eq!(s.ledger(2, None, None).unwrap().closing_minor, "20000");
+    assert_eq!(s.ledger(7, None, None).unwrap().closing_minor, "-20000");
+    assert!(
+        s.reverse(
+            receipt.journal_id,
+            "2026-10-04",
+            "Receipt correction",
+            "bad"
+        )
+        .is_err()
+    );
+    assert!(
+        s.reverse(cn.journal_id, "2026-10-04", "Note correction", "bad-cn")
+            .is_err()
+    );
+    assert!(
+        s.reverse(d.journal_id, "2026-10-04", "Invoice correction", "bad-inv")
+            .is_err()
+    );
+    s.reverse(
+        refunded.journal_id,
+        "2026-10-04",
+        "Refund correction",
+        "refund-undo",
+    )
+    .unwrap();
+    assert_eq!(view(&s, None).outstanding_minor, "-10000");
+    restore(&s);
+}
+fn refund_input(d: &Document, key: &str, amount: &str) -> DocumentInput {
+    let mut r = receipt(d, key, amount);
+    r.kind = if d.input.kind == "sale" {
+        "customer_refund"
+    } else {
+        "supplier_refund"
+    }
+    .into();
+    r.date = "2026-10-03".into();
+    r
+}
+#[test]
+fn stock_returns_restore_historical_sale_cost_and_purchase_variance_is_expensed() {
+    let mut s = books();
+    let c = party(&mut s, "customer");
+    let p = party(&mut s, "supplier");
+    let item = inventory(&mut s);
+    let stock = |kind: &str, pid, key: &str, qty: &str, price: &str| {
+        let mut d = invoice(kind, pid, key, price);
+        d.lines[0].quantity = qty.into();
+        d.lines[0].item_id = Some(item.id);
+        if kind == "purchase" {
+            d.lines[0].account_id = item.input.asset_account_id;
+        }
+        d
+    };
+    let first = s
+        .post_document(stock("purchase", p.id, "stock-1", "10", "10"))
+        .unwrap();
+    s.post_document(stock("purchase", p.id, "stock-2", "10", "20"))
+        .unwrap();
+    let sale = s
+        .post_document(stock("sale", c.id, "sale", "4", "30"))
+        .unwrap();
+    assert_eq!(
+        s.business_state(0, 50, None).unwrap().stock[0].value_minor,
+        "24000"
+    );
+    let cn = s
+        .post_document(return_note(&sale, "sold-return", "2"))
+        .unwrap();
+    assert_eq!(cn.correction.unwrap().lines[0].inventory_cost_minor, "3000");
+    let dn = s
+        .post_document(return_note(&first, "purchase-return", "2"))
+        .unwrap();
+    assert_eq!(dn.total_minor, "2000");
+    assert_eq!(dn.correction.unwrap().lines[0].inventory_cost_minor, "3000");
+    let b = s.business_state(0, 50, None).unwrap();
+    assert_eq!(b.stock[0].quantity_milli, "16000");
+    assert_eq!(b.stock[0].value_minor, "24000");
+    assert_eq!(
+        s.ledger(item.input.asset_account_id, None, None)
+            .unwrap()
+            .closing_minor,
+        "24000"
+    );
+    // Remaining sale COGS 30 + purchase return variance 10.
+    assert_eq!(
+        s.ledger(item.input.expense_account_id, None, None)
+            .unwrap()
+            .closing_minor,
+        "4000"
+    );
+    let mut too_many = return_note(&sale, "over-return", "2.001");
+    assert!(s.post_document(too_many.clone()).is_err());
+    too_many.return_lines.as_mut().unwrap()[0].quantity = "1".into();
+    too_many.date = "2026-10-02".into();
+    assert!(s.post_document(too_many).is_err());
+    restore(&s);
+    let mut bad: Value = serde_json::from_str(&s.export_backup().unwrap()).unwrap();
+    bad["business"]["documents"][3]["correction"]["lines"][0]["inventory_cost_minor"] =
+        json!("3001");
+    assert!(s.restore(&bad.to_string()).is_err());
+}
+#[test]
+fn stale_return_review_is_rejected_and_full_cancellation_rounds_exactly() {
+    let mut s = books();
+    let p = party(&mut s, "supplier");
+    let item = inventory(&mut s);
+    let mut input = invoice("purchase", p.id, "purchase", "0.01");
+    input.lines[0].quantity = "3".into();
+    input.lines[0].item_id = Some(item.id);
+    input.lines[0].account_id = item.input.asset_account_id;
+    let d = s.post_document(input.clone()).unwrap();
+    let mut note = return_note(&d, "review", "1");
+    let preview = s.preview_document(note.clone()).unwrap();
+    note.reviewed_postings=Some(serde_json::from_value::<Vec<PostingInput>>(preview["journal"]["lines"].as_array().unwrap().iter().map(|l|json!({"account_id":l["account_id"],"side":l["side"],"amount":decimal_amount(l["amount_minor"].as_str().unwrap().parse().unwrap())})).collect::<Vec<_>>().into()).unwrap());
+    // New purchase changes average carrying cost after the review.
+    input.request_id = "more-stock".into();
+    input.date = "2026-10-03".into();
+    input.lines[0].unit_price = "1".into();
+    s.post_document(input).unwrap();
+    assert!(s.post_document(note.clone()).is_err());
+    note.reviewed_postings = None;
+    for (i, qty) in [(0, "1"), (1, "1"), (2, "1")] {
+        note.request_id = format!("partial-{i}");
+        note.return_lines.as_mut().unwrap()[0].quantity = qty.into();
+        assert_eq!(s.post_document(note.clone()).unwrap().total_minor, "1");
+    }
+    assert!(s.post_document(return_note(&d, "extra", "0.001")).is_err());
+    restore(&s);
+}
+#[test]
+fn supplier_refund_reduces_bank_outflow_and_v3_backups_keep_retry_identity() {
+    let mut s = books();
+    let p = party(&mut s, "supplier");
+    let input = invoice("purchase", p.id, "supplier-bill", "100");
+    let d = s.post_document(input.clone()).unwrap();
+    s.post_document(receipt(&d, "paid", "100")).unwrap();
+    let mut v3: Value = serde_json::from_str(&s.export_backup().unwrap()).unwrap();
+    v3["version"] = json!(3);
+    v3["business"]["numbering"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|n| {
+            ["sale", "purchase", "receipt", "payment", "stock", "close"]
+                .contains(&n["kind"].as_str().unwrap())
+        });
+    let mut upgraded = LedgerStore::memory().unwrap();
+    upgraded.restore(&v3.to_string()).unwrap();
+    assert_eq!(upgraded.post_document(input).unwrap().id, d.id);
+    upgraded
+        .post_document(return_note(&d, "supplier-return", "1"))
+        .unwrap();
+    upgraded
+        .post_document(refund_input(&d, "supplier-refund", "100"))
+        .unwrap();
+    assert_eq!(upgraded.ledger(2, None, None).unwrap().closing_minor, "0");
+    assert_eq!(upgraded.ledger(5, None, None).unwrap().closing_minor, "0");
+    assert_eq!(upgraded.ledger(8, None, None).unwrap().closing_minor, "0");
+    assert_eq!(
+        upgraded
+            .business_state(0, 50, None)
+            .unwrap()
+            .numbering
+            .len(),
+        10
+    );
+    restore(&upgraded);
 }
 #[test]
 fn sales_partial_receipts_reversals_and_asof_outstandings_agree() {
@@ -566,6 +801,9 @@ fn stock_adjustments_are_balanced_and_forged_valuations_are_rejected() {
     let mut s = books();
     let item = inventory(&mut s);
     let input = DocumentInput {
+        gst_adjustment_reviewed: None,
+        return_lines: None,
+        reviewed_postings: None,
         gst: None,
         kind: "stock".into(),
         date: "2026-10-01".into(),

@@ -19,7 +19,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-24.04]
+        include:
+          - os: windows-latest
+            bundle: nsis
+          - os: ubuntu-24.04
+            bundle: deb
+          - os: ubuntu-24.04
+            bundle: appimage
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -52,11 +58,22 @@ jobs:
         shell: bash
         run: cd packages && sha256sum --check SHA256SUMS
       - name: Install Linux package and WebDriver dependencies
-        if: runner.os == 'Linux'
+        if: matrix.bundle == 'deb'
         run: |
           sudo apt-get update
           sudo apt-get install -y ./packages/*.deb webkit2gtk-driver xvfb
           echo 'OPEN_LEDGER_BINARY=/usr/bin/open-ledger-desktop' >> "$GITHUB_ENV"
+      - name: Prepare AppImage launch and WebDriver dependencies
+        if: matrix.bundle == 'appimage'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y webkit2gtk-driver xvfb libxdo3 libayatana-appindicator3-1 librsvg2-2
+          images=(packages/*.AppImage)
+          test "${#images[@]}" -eq 1
+          chmod +x "${images[0]}"
+          echo "OPEN_LEDGER_BINARY=$PWD/${images[0]}" >> "$GITHUB_ENV"
+          echo 'APPIMAGE_EXTRACT_AND_RUN=1' >> "$GITHUB_ENV"
+          echo 'Testing the AppImage runtime with its documented extract-and-run mode under Xvfb.' >> "$GITHUB_STEP_SUMMARY"
       - name: Install Windows package and matching WebDriver
         if: runner.os == 'Windows'
         shell: pwsh
@@ -90,6 +107,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: native-failure-${{ runner.os }}
+          name: native-failure-${{ runner.os }}-${{ matrix.bundle }}
           path: test-results/
           if-no-files-found: ignore

@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import AxeBuilder from '@axe-core/playwright';
 import { test, expect, Page, APIRequestContext } from '@playwright/test';
 async function api(request: APIRequestContext, command: string, payload: object = {}) {
   const response = await request.post(`/api/${command}`, { data: payload });
@@ -28,6 +29,160 @@ async function journal(request: APIRequestContext, key: string, amount = '100') 
     ],
   });
 }
+test('linked invoice cancellation, reviewed return and customer refund work through the interface', async ({
+  page,
+  request,
+}) => {
+  await company(page, request, 'Returns UI');
+  const party = await api(request, 'create_party', {
+    name: 'Return customer',
+    kind: 'customer',
+    contact: '',
+    account_id: 3,
+  });
+  const base = {
+    date: '2026-10-01',
+    due_date: '2026-10-02',
+    party_id: party.id,
+    invoice_id: null,
+    money_account_id: null,
+    amount: null,
+    note: 'Returnable service',
+    request_id: 'return-source',
+    kind: 'sale',
+    lines: [
+      {
+        description: 'Service units',
+        quantity: '3',
+        unit_price: '100',
+        account_id: 7,
+        item_id: null,
+      },
+    ],
+  };
+  const invoice = await api(request, 'post_document', base);
+  await api(request, 'post_document', {
+    ...base,
+    kind: 'receipt',
+    date: '2026-10-02',
+    due_date: null,
+    invoice_id: invoice.id,
+    money_account_id: 2,
+    amount: '300',
+    lines: [],
+    request_id: 'paid',
+  });
+  await nav(page, 'Invoices & settlements');
+  await page.getByRole('button', { name: 'Return / cancel', exact: true }).click();
+  await page.getByLabel('Return reason').fill('Cancel the remaining service');
+  await page.getByRole('button', { name: 'Cancel remaining invoice', exact: true }).click();
+  await expect(page.getByLabel(/Return quantity 1/)).toHaveValue('3.000');
+  await page.getByRole('button', { name: 'Review return', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Review sales credit note' })).toBeVisible();
+  await expect(page.getByLabel('Invoice return')).toContainText('₹300.00');
+  await page.getByRole('button', { name: 'Post return note', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'CN-000001', exact: true })).toBeVisible();
+  const row = page
+    .getByRole('row')
+    .filter({ has: page.getByRole('button', { name: 'INV-000001', exact: true }) });
+  await expect(row).toContainText('Refund due');
+  await page.getByRole('button', { name: 'Record refund', exact: true }).click();
+  await page.getByLabel('Cash / bank account').selectOption('2');
+  await expect(page.getByLabel('Amount', { exact: true })).toHaveValue('300.00');
+  await page.getByRole('button', { name: 'Review document' }).click();
+  await page.getByRole('button', { name: 'Post customer refund', exact: true }).click();
+  await expect(row).toContainText('Fully credited');
+  await page.getByRole('button', { name: 'CN-000001', exact: true }).click();
+  await expect(page.getByText('Linked original invoice:', { exact: false }).last()).toContainText(
+    'INV-000001',
+  );
+  const downloading = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export document (HTML)' }).click();
+  const exported = await downloading;
+  const path = await exported.path();
+  const text = readFileSync(path!, 'utf8');
+  expect(text).toContain('Service units');
+  expect(text).toContain('Linked original invoice: INV-000001');
+  const ledger = await api(request, 'ledger', { account_id: 2, from: null, to: null });
+  expect(ledger.closing_minor).toBe('0');
+});
+
+test('stock return preview exposes original issue cost and preserves inventory after restore', async ({
+  page,
+  request,
+}) => {
+  await company(page, request, 'Stock returns UI');
+  const supplier = await api(request, 'create_party', {
+    name: 'Stock supplier',
+    kind: 'supplier',
+    contact: '',
+    account_id: 5,
+  });
+  const customer = await api(request, 'create_party', {
+    name: 'Stock customer',
+    kind: 'customer',
+    contact: '',
+    account_id: 3,
+  });
+  const asset = await api(request, 'create_account', {
+    code: '1300',
+    name: 'Inventory',
+    kind: 'asset',
+  });
+  const item = await api(request, 'create_item', {
+    code: 'W',
+    name: 'Widget',
+    unit: 'pcs',
+    asset_account_id: asset.id,
+    expense_account_id: 8,
+  });
+  const base = {
+    date: '2026-10-01',
+    due_date: '2026-10-02',
+    party_id: supplier.id,
+    invoice_id: null,
+    money_account_id: null,
+    amount: null,
+    note: 'Stock purchase',
+    request_id: 'stock-in',
+    kind: 'purchase',
+    lines: [
+      {
+        description: 'Widget',
+        quantity: '10',
+        unit_price: '10',
+        account_id: asset.id,
+        item_id: item.id,
+      },
+    ],
+  };
+  await api(request, 'post_document', base);
+  await api(request, 'post_document', {
+    ...base,
+    party_id: customer.id,
+    kind: 'sale',
+    request_id: 'stock-sale',
+    lines: [{ ...base.lines[0], quantity: '4', unit_price: '30', account_id: 7 }],
+  });
+  await nav(page, 'Invoices & settlements');
+  const saleRow = page
+    .getByRole('row')
+    .filter({ has: page.getByRole('button', { name: 'INV-000001', exact: true }) });
+  await saleRow.getByRole('button', { name: 'Return / cancel', exact: true }).click();
+  await page.getByLabel('Return reason').fill('Two units returned');
+  await page.getByLabel(/Return quantity 1/).fill('2');
+  await page.getByRole('button', { name: 'Review return', exact: true }).click();
+  await expect(page.getByLabel('Invoice return')).toContainText('₹20.00');
+  await page.getByRole('button', { name: 'Post return note', exact: true }).click();
+  await expect(saleRow).toContainText('60.00');
+  const b = await api(request, 'business', { offset: 0, limit: 50, as_of: null });
+  expect(b.stock[0].quantity_milli).toBe('8000');
+  expect(b.stock[0].value_minor).toBe('8000');
+  const backup = await api(request, 'backup');
+  await api(request, 'restore_backup', { contents: backup });
+  const restored = await api(request, 'business', { offset: 0, limit: 50, as_of: null });
+  expect(restored.stock).toEqual(b.stock);
+});
 
 test('invalid native locales and unavailable preference storage preserve access to books', async ({
   page,
@@ -163,6 +318,89 @@ test('keyboard focus, pagination, and locale display remain usable', async ({ pa
   await nav(page, 'Company & periods');
   await page.getByLabel('Number and date locale').selectOption('en-IN');
   await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
+});
+test('core pages, invoice forms and journal dialog pass automated accessibility checks', async ({
+  page,
+  request,
+}) => {
+  await company(page, request, 'Accessibility checks');
+  const check = async (name: string) => {
+    const results = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
+      .analyze();
+    expect(
+      results.violations.map((v) => ({
+        id: v.id,
+        impact: v.impact,
+        nodes: v.nodes.map((n) => ({ target: n.target, summary: n.failureSummary })),
+      })),
+      name,
+    ).toEqual([]);
+  };
+  await check('Overview');
+  for (const name of [
+    'Journal entries',
+    'Chart of accounts',
+    'Account ledger',
+    'Trial balance',
+    'Invoices & settlements',
+    'Inventory',
+    'Financial statements',
+    'Bank reconciliation',
+    'Company & periods',
+    'Backups',
+  ]) {
+    await nav(page, name);
+    await check(name);
+  }
+  await nav(page, 'Invoices & settlements');
+  await page.getByRole('button', { name: 'New sales invoice' }).click();
+  await check('Invoice form');
+  await page.keyboard.press('Escape');
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+j' : 'Control+j');
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await check('Journal dialog');
+  await page.keyboard.press('Escape');
+  await api(request, 'new_books', {});
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Create your company' })).toBeVisible();
+  await check('Welcome form');
+  await api(request, 'create_demo');
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
+  await check('Populated books');
+});
+test('narrow reflow, keyboard navigation and forced colors preserve access to core workflows', async ({
+  page,
+  request,
+}, testInfo) => {
+  await company(page, request, 'Reflow checks');
+  await page.setViewportSize({ width: 320, height: 800 });
+  await page.emulateMedia({ forcedColors: 'active', reducedMotion: 'reduce' });
+  for (const name of [
+    'Invoices & settlements',
+    'Inventory',
+    'Financial statements',
+    'Bank reconciliation',
+    'Company & periods',
+    'Backups',
+  ]) {
+    const toggle = page.getByRole('button', { name: 'Toggle navigation' });
+    await toggle.focus();
+    await page.keyboard.press('Enter');
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await nav(page, name);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(page.locator('h1')).toBeFocused();
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1),
+      name,
+    ).toBe(true);
+  }
+  await page.getByRole('button', { name: 'Toggle navigation' }).click();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('button', { name: 'Toggle navigation' })).toBeFocused();
+  await page.screenshot({ path: testInfo.outputPath('forced-colors-reflow.png'), fullPage: true });
 });
 test('loopback API rejects foreign origins', async ({ request }) => {
   const response = await request.post('/api/state', {
@@ -311,6 +549,19 @@ test('India GST setup, invoice tax and register work through the interface', asy
   const download = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Export GST register', exact: true }).click();
   expect((await download).suggestedFilename()).toContain('gst-register');
+  await nav(page, 'Invoices & settlements');
+  await page.getByRole('button', { name: 'Return / cancel', exact: true }).click();
+  await page.getByLabel('Return reason').fill('GST full cancellation');
+  await page.getByRole('checkbox', { name: /I reviewed GST adjustment eligibility/ }).check();
+  await page.getByRole('button', { name: 'Cancel remaining invoice', exact: true }).click();
+  await page.getByRole('button', { name: 'Review return', exact: true }).click();
+  await expect(page.getByLabel('Invoice return')).toContainText('₹1,180.00');
+  await page.getByRole('button', { name: 'Post return note', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'CN-000001', exact: true })).toBeVisible();
+  const report = await api(request, 'gst_report', { from: '2026-01-01', to: '2026-12-31' });
+  expect(report.totals.sale.taxable_minor).toBe('0');
+  expect(report.totals.sale.cgst_minor).toBe('0');
+  expect(report.rows[1].original_invoice).toBe('INV-000001');
 });
 
 test('experimental Tally XML mapping, preview and import work through the interface', async ({

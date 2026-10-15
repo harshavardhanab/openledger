@@ -47,6 +47,12 @@ pub struct DocumentLine {
 #[serde(deny_unknown_fields)]
 pub struct DocumentInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gst_adjustment_reviewed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_lines: Option<Vec<crate::ReturnLine>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_postings: Option<Vec<PostingInput>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gst: Option<crate::GstInput>,
     pub kind: String,
     pub date: String,
@@ -63,6 +69,8 @@ pub struct DocumentInput {
 #[serde(deny_unknown_fields)]
 pub struct Document {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction: Option<crate::Correction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gst: Option<crate::GstCalculation>,
     pub id: i64,
     pub number: String,
@@ -75,6 +83,7 @@ pub struct DocumentView {
     #[serde(flatten)]
     pub document: Document,
     pub paid_minor: String,
+    pub credited_minor: String,
     pub outstanding_minor: String,
     pub reversed: bool,
 }
@@ -322,7 +331,7 @@ pub(crate) fn check_stock_accounts(tx: &Transaction<'_>, p: &ValidatedJournal) -
     }
     Ok(())
 }
-fn stock_totals(tx: &Transaction<'_>, item_id: i64) -> Result<(i64, i64)> {
+pub(crate) fn stock_totals(tx: &Transaction<'_>, item_id: i64) -> Result<(i64, i64)> {
     let mut q =
         tx.prepare("SELECT quantity_milli,value_minor FROM stock_moves WHERE item_id=?1")?;
     let mut qty = 0i128;
@@ -339,11 +348,12 @@ fn stock_totals(tx: &Transaction<'_>, item_id: i64) -> Result<(i64, i64)> {
         i64::try_from(value).map_err(|_| invalid("Stock value exceeds range."))?,
     ))
 }
-struct Prepared {
-    gst: Option<crate::GstCalculation>,
-    total: i64,
-    lines: Vec<PostingInput>,
-    moves: Vec<(i64, i64, i64)>,
+pub(crate) struct Prepared {
+    pub(crate) correction: Option<crate::Correction>,
+    pub(crate) gst: Option<crate::GstCalculation>,
+    pub(crate) total: i64,
+    pub(crate) lines: Vec<PostingInput>,
+    pub(crate) moves: Vec<(i64, i64, i64)>,
 }
 fn prepare_document(
     tx: &Transaction<'_>,
@@ -358,16 +368,28 @@ fn prepare_document(
     if last_close.is_some_and(|s| d.date <= s) {
         return Err(invalid("This financial period is closed."));
     }
+    if ["credit_note", "debit_note"].contains(&d.kind.as_str()) {
+        return crate::corrections::prepare_correction(tx, d, replay_before);
+    }
+    if d.gst_adjustment_reviewed.is_some() {
+        return Err(invalid(
+            "GST adjustment review applies only to return notes.",
+        ));
+    }
+    if d.return_lines.is_some() {
+        return Err(invalid("Return quantities require a credit or debit note."));
+    }
     if d.gst.is_some() && !["sale", "purchase"].contains(&d.kind.as_str()) {
         return Err(invalid("Only invoices support GST."));
     }
     let mut result = Prepared {
+        correction: None,
         gst: None,
         total: 0,
         lines: vec![],
         moves: vec![],
     };
-    if ["receipt", "payment"].contains(&d.kind.as_str()) {
+    if ["receipt", "payment", "customer_refund", "supplier_refund"].contains(&d.kind.as_str()) {
         if !d.lines.is_empty() || d.due_date.is_some() {
             return Err(invalid(
                 "Settlements cannot have invoice lines or due dates.",
@@ -384,8 +406,10 @@ fn prepare_document(
             )
             .optional()?
             .ok_or_else(|| invalid("Invoice not found."))?;
-        if (d.kind == "receipt" && kind != "sale")
-            || (d.kind == "payment" && kind != "purchase")
+        let customer = ["receipt", "customer_refund"].contains(&d.kind.as_str());
+        let refund = ["customer_refund", "supplier_refund"].contains(&d.kind.as_str());
+        if (customer && kind != "sale")
+            || (!customer && kind != "purchase")
             || d.party_id != Some(party)
         {
             return Err(invalid("Settlement type and party must match the invoice."));
@@ -407,22 +431,18 @@ fn prepare_document(
                 "Settlements must follow the latest settlement or reversal date for this invoice.",
             ));
         }
-        let mut paid = 0i128;
-        let mut q=tx.prepare("SELECT d.total_minor,d.date FROM documents d WHERE invoice_id=?1 AND NOT EXISTS(SELECT 1 FROM journals r WHERE r.reversal_of=d.journal_id AND (?2 IS NULL OR r.id<?2))")?;
-        for r in q.query_map(params![invoice_id, replay_before], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })? {
-            let (n, _) = r?;
-            paid += i128::from(n);
-        }
+        let (paid, credited) =
+            crate::corrections::allocations(tx, invoice_id, None, replay_before)?;
         result.total = parse_amount(
             d.amount
                 .as_deref()
                 .ok_or_else(|| invalid("Enter a settlement amount."))?,
         )?;
-        if paid + i128::from(result.total) > i128::from(total) {
+        let outstanding = i128::from(total) - paid - credited;
+        let available = if refund { -outstanding } else { outstanding };
+        if i128::from(result.total) > available {
             return Err(invalid(
-                "Payment exceeds the invoice's outstanding balance.",
+                "Settlement exceeds the invoice's outstanding balance or available refund credit.",
             ));
         }
         let bank = d
@@ -437,7 +457,7 @@ fn prepare_document(
         if bank == control || used > 0 {
             return Err(invalid("Use a separate cash or bank asset account."));
         }
-        let side = if d.kind == "receipt" {
+        let side = if ["receipt", "supplier_refund"].contains(&d.kind.as_str()) {
             Side::Debit
         } else {
             Side::Credit
@@ -768,6 +788,13 @@ impl LedgerStore {
             return Ok(serde_json::from_str(&data)?);
         }
         let prepared = prepare_document(&tx, &input, None)?;
+        if let Some(expected) = &input.reviewed_postings
+            && expected != &prepared.lines
+        {
+            return Err(invalid(
+                "The posting changed since review. Preview the document again.",
+            ));
+        }
         let number = next_number(&tx, &input.kind)?;
         crate::gst::validate_gst_number(&input, &number)?;
         let journal_id =
@@ -776,6 +803,7 @@ impl LedgerStore {
             r.get(0)
         })?;
         let doc = Document {
+            correction: prepared.correction.clone(),
             gst: prepared.gst.clone(),
             id,
             number,
@@ -804,6 +832,23 @@ impl LedgerStore {
         Ok(())
     }
     pub(crate) fn check_business_reversal_date(&self, id: i64, date: &str) -> Result<()> {
+        let linked: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT invoice_id FROM documents WHERE journal_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(invoice) = linked {
+            let latest: Option<String> = self.conn.query_row("SELECT MAX(date) FROM (SELECT date FROM documents WHERE id=?1 OR invoice_id=?1 UNION ALL SELECT r.date FROM documents d JOIN journals r ON r.reversal_of=d.journal_id WHERE d.invoice_id=?1)", [invoice], |r| r.get(0))?;
+            if latest.is_some_and(|latest| date < latest.as_str()) {
+                return Err(invalid(
+                    "Settlement reversal must follow all related invoice events.",
+                ));
+            }
+        }
         let latest:Option<String>=self.conn.query_row("SELECT MAX(r.date) FROM documents i JOIN documents p ON p.invoice_id=i.id JOIN journals r ON r.reversal_of=p.journal_id WHERE i.journal_id=?1",[id],|r|r.get(0))?;
         if latest.is_some_and(|s| date < s.as_str()) {
             return Err(invalid(
@@ -813,6 +858,21 @@ impl LedgerStore {
         Ok(())
     }
     pub(crate) fn check_business_reversal(&self, id: i64) -> Result<()> {
+        let notes:i64=self.conn.query_row("SELECT COUNT(*) FROM documents WHERE (journal_id=?1 AND kind IN ('credit_note','debit_note')) OR (invoice_id IN (SELECT id FROM documents WHERE journal_id=?1) AND kind IN ('credit_note','debit_note'))",[id],|r|r.get(0))?;
+        if notes > 0 {
+            return Err(invalid(
+                "Credit/debit notes and their original invoices cannot be reversed independently. Use a new replacement invoice for a correction.",
+            ));
+        }
+        let settlement: Option<(i64,String,i64)> = self.conn.query_row("SELECT invoice_id,kind,total_minor FROM documents WHERE journal_id=?1 AND kind IN ('receipt','payment')", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        if let Some((invoice, _, amount)) = settlement {
+            let (paid, _) = crate::corrections::allocations(&self.conn, invoice, None, None)?;
+            if paid < i128::from(amount) {
+                return Err(invalid(
+                    "Reverse linked refunds before reversing their original receipt or payment.",
+                ));
+            }
+        }
         let stock:i64=self.conn.query_row("SELECT COUNT(*) FROM stock_moves m JOIN documents d ON m.document_id=d.id WHERE d.journal_id=?1",[id],|r|r.get(0))?;
         if stock > 0 {
             return Err(invalid(
@@ -965,11 +1025,7 @@ impl LedgerStore {
         })? {
             let (json, reversed) = r?;
             let d: Document = serde_json::from_str(&json)?;
-            let mut paid = 0i128;
-            let mut payments=self.conn.prepare("SELECT p.total_minor FROM documents p WHERE p.invoice_id=?1 AND (?2 IS NULL OR p.date<=?2) AND NOT EXISTS(SELECT 1 FROM journals r WHERE r.reversal_of=p.journal_id AND (?2 IS NULL OR r.date<=?2))")?;
-            for n in payments.query_map(params![d.id, as_of], |r| r.get::<_, i64>(0))? {
-                paid += i128::from(n?);
-            }
+            let (paid, credited) = crate::corrections::allocations(&self.conn, d.id, as_of, None)?;
             let total = d
                 .total_minor
                 .parse::<i128>()
@@ -978,11 +1034,12 @@ impl LedgerStore {
             {
                 0
             } else {
-                total - paid
+                total - paid - credited
             };
             docs.push(DocumentView {
                 document: d,
                 paid_minor: paid.to_string(),
+                credited_minor: credited.to_string(),
                 outstanding_minor: outstanding.to_string(),
                 reversed,
             });
@@ -1360,6 +1417,16 @@ impl LedgerStore {
             if d.gst != prepared.gst {
                 return Err(invalid("GST amounts do not match the invoice."));
             }
+            if d.correction != prepared.correction {
+                return Err(invalid(
+                    "Credit/debit note details do not match their original invoice.",
+                ));
+            }
+            if let Some(expected) = &d.input.reviewed_postings
+                && expected != &prepared.lines
+            {
+                return Err(invalid("Reviewed posting does not match the document."));
+            }
             if d.total_minor != prepared.total.to_string() {
                 return Err(invalid("Document total does not match its lines."));
             }
@@ -1404,7 +1471,21 @@ impl LedgerStore {
                 [d.journal_id],
                 |r| r.get(0),
             )?;
-            if rev > 0 && b.stock_moves.iter().any(|m| m.document_id == d.id) {
+            if rev > 0 && ["receipt", "payment"].contains(&d.input.kind.as_str()) {
+                // A reversed settlement must not fund a still-active refund.
+                let (paid, _) =
+                    crate::corrections::allocations(&tx, d.input.invoice_id.unwrap(), None, None)?;
+                if paid < 0 {
+                    return Err(invalid("Refunds exceed active settlements."));
+                }
+            }
+            if rev > 0
+                && (d.correction.is_some()
+                    || docs
+                        .iter()
+                        .any(|n| n.input.invoice_id == Some(d.id) && n.correction.is_some())
+                    || b.stock_moves.iter().any(|m| m.document_id == d.id))
+            {
                 return Err(invalid(
                     "An inventory journal cannot be reversed independently.",
                 ));
@@ -1413,8 +1494,19 @@ impl LedgerStore {
         let mut kinds = BTreeSet::new();
         for n in b.numbering {
             if !kinds.insert(n.kind.clone())
-                || !["sale", "purchase", "receipt", "payment", "stock", "close"]
-                    .contains(&n.kind.as_str())
+                || ![
+                    "sale",
+                    "purchase",
+                    "receipt",
+                    "payment",
+                    "stock",
+                    "close",
+                    "credit_note",
+                    "debit_note",
+                    "customer_refund",
+                    "supplier_refund",
+                ]
+                .contains(&n.kind.as_str())
                 || n.next <= 0
                 || n.next == i64::MAX
             {
@@ -1426,7 +1518,10 @@ impl LedgerStore {
                 params![n.prefix, n.next, n.kind],
             )?;
         }
-        if kinds.len() != 6 {
+        if !["sale", "purchase", "receipt", "payment", "stock", "close"]
+            .iter()
+            .all(|k| kinds.contains(*k))
+        {
             return Err(invalid("Missing numbering sequences."));
         }
         // Unlinked inventory journals would undermine the stock-to-ledger agreement.

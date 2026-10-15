@@ -7,3 +7,8 @@ src-tauri/gen/
 src-tauri/icons/
 Cargo.lock
 package-lock.json
+
+# Opaque vendor binaries and local research are not formatter input.
+**/*.exe
+**/*.dll
+**/*.nfo

@@ -72,7 +72,22 @@ type GstCalculation = {
   }[];
 };
 type ComposerLine = DocLine & { gst_rate?: string; hsn_sac?: string };
+type ReturnLine = { line: number; quantity: string };
+type Correction = {
+  invoice_number: string;
+  invoice_date: string;
+  original_gst: GstInput | null;
+  lines: (DocLine & {
+    original_line: number;
+    taxable_minor: string;
+    inventory_cost_minor: string;
+  })[];
+};
+type ReviewedPosting = { account_id: number; side: 'debit' | 'credit'; amount: string };
 type DocInput = {
+  gst_adjustment_reviewed?: boolean;
+  return_lines?: ReturnLine[];
+  reviewed_postings?: ReviewedPosting[];
   gst?: GstInput;
   kind: string;
   date: string;
@@ -86,6 +101,8 @@ type DocInput = {
   request_id: string;
 };
 type Doc = {
+  correction?: Correction;
+  credited_minor: string;
   gst?: GstCalculation;
   id: number;
   number: string;
@@ -141,6 +158,10 @@ const docNames: Record<string, string> = {
   receipt: 'Receipt',
   payment: 'Payment',
   stock: 'Stock adjustment',
+  credit_note: 'Sales credit note',
+  debit_note: 'Purchase return note',
+  customer_refund: 'Customer refund',
+  supplier_refund: 'Supplier refund',
   close: 'Period close',
 };
 const err = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -248,6 +269,7 @@ function Documents(
   const [compose, setCompose] = useState<string | null>(null),
     [settle, setSettle] = useState<Doc | null>(null),
     [detail, setDetail] = useState<Doc | null>(null),
+    [returnInvoice, setReturnInvoice] = useState<Doc | null>(null),
     [showParties, setShowParties] = useState(false),
     [filter, setFilter] = useState('all');
   const currency = state.company!.currency;
@@ -304,10 +326,23 @@ function Documents(
           }}
         />
       )}
+      {returnInvoice && !compose && (
+        <ReturnComposer {...props} invoice={returnInvoice} close={() => setReturnInvoice(null)} />
+      )}
       <section className="panel">
         <div className="panel-toolbar">
           <div className="tabs">
-            {['all', 'sale', 'purchase', 'receipt', 'payment'].map((k) => (
+            {[
+              'all',
+              'sale',
+              'purchase',
+              'receipt',
+              'payment',
+              'credit_note',
+              'debit_note',
+              'customer_refund',
+              'supplier_refund',
+            ].map((k) => (
               <button
                 key={k}
                 className={filter === k ? 'selected' : ''}
@@ -352,7 +387,15 @@ function Documents(
                         ? d.input.due_date! < (props.asOf || today())
                           ? 'Overdue'
                           : 'Open'
-                        : 'Settled'}
+                        : BigInt(d.outstanding_minor) < 0n
+                          ? 'Refund due'
+                          : !['sale', 'purchase'].includes(d.input.kind)
+                            ? 'Posted'
+                            : BigInt(d.credited_minor) === BigInt(d.total_minor)
+                              ? 'Fully credited'
+                              : BigInt(d.credited_minor) > 0n
+                                ? 'Settled · partly credited'
+                                : 'Settled'}
                   </td>
                   <td className="numeric">{money(d.total_minor, currency)}</td>
                   <td className="numeric">{money(d.outstanding_minor, currency)}</td>
@@ -361,6 +404,33 @@ function Documents(
                       <button className="text-button" onClick={() => open(d.journal_id)}>
                         Journal
                       </button>
+                      {!d.reversed &&
+                        ['sale', 'purchase'].includes(d.input.kind) &&
+                        BigInt(d.credited_minor) < BigInt(d.total_minor) && (
+                          <button
+                            className="text-button"
+                            onClick={() => {
+                              setCompose(null);
+                              setReturnInvoice(d);
+                            }}
+                          >
+                            Return / cancel
+                          </button>
+                        )}
+                      {!d.reversed && BigInt(d.outstanding_minor) < 0n && (
+                        <button
+                          className="text-button"
+                          onClick={() => {
+                            setSettle(d);
+                            setReturnInvoice(null);
+                            setCompose(
+                              d.input.kind === 'sale' ? 'customer_refund' : 'supplier_refund',
+                            );
+                          }}
+                        >
+                          Record refund
+                        </button>
+                      )}
                       {!d.reversed && BigInt(d.outstanding_minor) > 0n && (
                         <button
                           className="text-button"
@@ -401,7 +471,11 @@ function Documents(
             {data.parties.find((p) => p.id === detail.input.party_id)?.input.name} ·{' '}
             {data.parties.find((p) => p.id === detail.input.party_id)?.input.contact}
           </p>
-          <DocumentLines lines={detail.input.lines} currency={currency} />
+          {detail.correction ? (
+            <ReturnDetails correction={detail.correction} currency={currency} />
+          ) : (
+            <DocumentLines lines={detail.input.lines} currency={currency} />
+          )}
           {detail.gst && <GstAmounts calc={detail.gst} currency={currency} />}
           <p>{detail.input.note}</p>
           <strong>Total: {money(detail.total_minor, currency)}</strong>
@@ -568,6 +642,270 @@ function DocumentLines({ lines, currency }: { lines: DocLine[]; currency: string
     </div>
   );
 }
+function ReturnDetails({ correction, currency }: { correction: Correction; currency: string }) {
+  return (
+    <>
+      <p>
+        Linked original invoice: <strong>{correction.invoice_number}</strong> ·{' '}
+        {displayDate(correction.invoice_date)}
+      </p>
+      <div className="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Description</th>
+              <th>Returned quantity</th>
+              <th className="numeric">Taxable credit</th>
+              <th className="numeric">Stock cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            {correction.lines.map((l) => (
+              <tr key={l.original_line}>
+                <td>{l.description}</td>
+                <td>{l.quantity}</td>
+                <td className="numeric">{money(l.taxable_minor, currency)}</td>
+                <td className="numeric">
+                  {l.item_id ? money(l.inventory_cost_minor, currency) : '—'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+function ReturnComposer({
+  invoice,
+  close,
+  state,
+  busy,
+  mutate,
+  onError,
+}: Props & { data: Business; invoice: Doc; close: () => void }) {
+  const [source, setSource] = useState<{ invoice: Doc; remaining_milli: string[] } | null>(null);
+  const [quantities, setQuantities] = useState<string[]>([]);
+  const [date, setDate] = useState(today()),
+    [reason, setReason] = useState('');
+  const [working, setWorking] = useState(false);
+  const [taxReviewed, setTaxReviewed] = useState(false);
+  const [review, setReview] = useState<{
+    document: Doc;
+    journal: Journal;
+    payload: DocInput;
+  } | null>(null);
+  const [requestId, setRequestId] = useState(() => crypto.randomUUID());
+  useEffect(() => {
+    let active = true;
+    request<{ invoice: Doc; remaining_milli: string[] }>('returnable_invoice', { id: invoice.id })
+      .then((result) => {
+        if (active) {
+          setSource(result);
+          setQuantities(result.remaining_milli.map(() => ''));
+        }
+      })
+      .catch((e) => {
+        if (active) onError(err(e));
+      });
+    return () => {
+      active = false;
+    };
+  }, [invoice.id, onError]);
+  const formatQty = (milli: string) => {
+    const n = BigInt(milli);
+    return `${n / 1000n}.${(n % 1000n).toString().padStart(3, '0')}`;
+  };
+  const currency = state.company!.currency;
+  return (
+    <section className="panel business-card" aria-label="Invoice return">
+      <div className="panel-title">
+        <h2>Return / cancel {invoice.number}</h2>
+        <button className="button secondary" disabled={busy || working} onClick={close}>
+          Close return
+        </button>
+      </div>
+      <p>
+        The original invoice stays in the audit trail. A full cancellation credits all remaining
+        quantities. Refunds are recorded separately after posting the note.
+      </p>
+      {invoice.input.kind === 'purchase' && (
+        <p>
+          Purchase return notes record a buyer’s commercial adjustment. Obtain and review the
+          supplier’s statutory credit note separately.
+        </p>
+      )}
+      {review ? (
+        <>
+          <h3>Review {docNames[review.document.input.kind].toLowerCase()}</h3>
+          <p>
+            {displayDate(review.payload.date)} · {review.payload.note}
+          </p>
+          <ReturnDetails correction={review.document.correction!} currency={currency} />
+          {review.document.gst && <GstAmounts calc={review.document.gst} currency={currency} />}
+          <strong>Invoice reduction: {money(review.document.total_minor, currency)}</strong>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Account</th>
+                  <th>Side</th>
+                  <th className="numeric">Amount</th>
+                </tr>
+              </thead>
+              <tbody>
+                {review.journal.lines.map((l, i) => (
+                  <tr key={i}>
+                    <td>{state.accounts.find((a) => a.id === l.account_id)?.name}</td>
+                    <td>{l.side}</td>
+                    <td className="numeric">{money(l.amount_minor, currency)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p>
+            Sales returns restore original issue cost. Purchase returns use current weighted average
+            cost; any price difference posts to the item’s expense account. Review GST adjustments
+            before issue.
+          </p>
+          <div className="business-actions">
+            <button
+              className="button secondary"
+              disabled={busy}
+              onClick={() => {
+                setReview(null);
+                setRequestId(crypto.randomUUID());
+              }}
+            >
+              Edit return
+            </button>
+            <button
+              className="button primary"
+              disabled={busy}
+              onClick={async () => {
+                const reviewed_postings = review.journal.lines.map((l) => ({
+                  account_id: l.account_id,
+                  side: l.side,
+                  amount: decimal(BigInt(l.amount_minor)),
+                }));
+                if (
+                  await mutate(
+                    'post_document',
+                    { ...review.payload, reviewed_postings },
+                    'Linked return posted.',
+                  )
+                )
+                  close();
+                else setReview(null);
+              }}
+            >
+              Post return note
+            </button>
+          </div>
+        </>
+      ) : source ? (
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault();
+            setWorking(true);
+            const payload: DocInput = {
+              kind: invoice.input.kind === 'sale' ? 'credit_note' : 'debit_note',
+              date,
+              due_date: null,
+              party_id: invoice.input.party_id,
+              invoice_id: invoice.id,
+              money_account_id: null,
+              amount: null,
+              note: reason,
+              lines: [],
+              ...(invoice.gst ? { gst_adjustment_reviewed: taxReviewed } : {}),
+              return_lines: quantities.flatMap((quantity, line) =>
+                quantity.trim() && Number(quantity) !== 0 ? [{ line, quantity }] : [],
+              ),
+              request_id: requestId,
+            };
+            try {
+              const result = await request<{ document: Doc; journal: Journal }>(
+                'preview_document',
+                payload,
+              );
+              setReview({ ...result, payload });
+            } catch (e) {
+              onError(err(e));
+            } finally {
+              setWorking(false);
+            }
+          }}
+        >
+          <div className="business-grid">
+            <Field name="Return date">
+              <input
+                type="date"
+                required
+                min={invoice.input.date}
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+              />
+            </Field>
+            <Field name="Return reason">
+              <input
+                required
+                maxLength={500}
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+              />
+            </Field>
+          </div>
+          {invoice.gst && (
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                required
+                checked={taxReviewed}
+                onChange={(e) => setTaxReviewed(e.target.checked)}
+              />{' '}
+              I reviewed GST adjustment eligibility and the supporting supplier/recipient documents.
+            </label>
+          )}
+          {source.invoice.input.lines.map((l, i) => (
+            <Field
+              key={i}
+              name={`Return quantity ${i + 1}: ${l.description} (available ${formatQty(source.remaining_milli[i])})`}
+            >
+              <input
+                type="number"
+                min="0"
+                step="0.001"
+                max={formatQty(source.remaining_milli[i])}
+                disabled={BigInt(source.remaining_milli[i]) === 0n || working}
+                value={quantities[i] || ''}
+                onChange={(e) =>
+                  setQuantities((old) => old.map((n, index) => (index === i ? e.target.value : n)))
+                }
+              />
+            </Field>
+          ))}
+          <div className="business-actions">
+            <button
+              type="button"
+              className="button secondary"
+              disabled={working || busy}
+              onClick={() => setQuantities(source.remaining_milli.map(formatQty))}
+            >
+              Cancel remaining invoice
+            </button>
+            <button className="button primary" disabled={working || busy}>
+              Review return
+            </button>
+          </div>
+        </form>
+      ) : (
+        <p role="status">Loading remaining invoice quantities…</p>
+      )}
+    </section>
+  );
+}
 function DocumentComposer({
   kind,
   invoice,
@@ -578,13 +916,21 @@ function DocumentComposer({
   mutate,
   onError,
 }: Props & { data: Business; kind: string; invoice: Doc | null; close: () => void }) {
-  const settlement = kind === 'receipt' || kind === 'payment',
+  const settlement = ['receipt', 'payment', 'customer_refund', 'supplier_refund'].includes(kind),
     stock = kind === 'stock';
   const [date, setDate] = useState(today()),
     [due, setDue] = useState(today()),
     [party, setParty] = useState(invoice?.input.party_id || 0),
     [bank, setBank] = useState(0),
-    [amount, setAmount] = useState(invoice ? decimal(BigInt(invoice.outstanding_minor)) : ''),
+    [amount, setAmount] = useState(
+      invoice
+        ? decimal(
+            BigInt(invoice.outstanding_minor) < 0n
+              ? -BigInt(invoice.outstanding_minor)
+              : BigInt(invoice.outstanding_minor),
+          )
+        : '',
+    ),
     [note, setNote] = useState(''),
     [direction, setDirection] = useState('add');
   const [lines, setLines] = useState<ComposerLine[]>([
@@ -787,7 +1133,11 @@ function DocumentComposer({
               </Field>
             )}
             {!stock && (
-              <Field name={kind === 'sale' || kind === 'receipt' ? 'Customer' : 'Supplier'}>
+              <Field
+                name={
+                  ['sale', 'receipt', 'customer_refund'].includes(kind) ? 'Customer' : 'Supplier'
+                }
+              >
                 <select
                   required
                   disabled={settlement}
@@ -799,7 +1149,9 @@ function DocumentComposer({
                     .filter(
                       (p) =>
                         p.input.kind ===
-                        (kind === 'sale' || kind === 'receipt' ? 'customer' : 'supplier'),
+                        (['sale', 'receipt', 'customer_refund'].includes(kind)
+                          ? 'customer'
+                          : 'supplier'),
                     )
                     .map((p) => (
                       <option key={p.id} value={p.id}>
@@ -1955,12 +2307,13 @@ function exportDocument(d: Doc, data: Business, state: Snapshot, print = false) 
       .replaceAll('"', '&quot;');
   const party = data.parties.find((p) => p.id === d.input.party_id);
   const currency = state.company!.currency;
-  const g = d.input.gst;
+  const g = d.input.gst || d.correction?.original_gst;
+  const isSale = ['sale', 'credit_note'].includes(d.input.kind);
   const gstHtml =
     d.gst && g && data.gst
-      ? `<h3>India GST invoice particulars</h3><p>Supplier: ${escape(d.input.kind === 'sale' ? state.company!.name : party?.input.name || '')} · Registration: ${escape(d.input.kind === 'sale' ? data.gst.gstin : g.counterparty_gstin || '')} · ${escape(d.input.kind === 'sale' ? data.gst.address : g.counterparty_address)}</p><p>Recipient registration: ${escape(d.input.kind === 'sale' ? g.counterparty_gstin || 'Unregistered' : data.gst.gstin)} · ${escape(d.input.kind === 'sale' ? g.counterparty_address : data.gst.address)}</p><p>Place of supply: ${escape(g.supply_state_name)} (${escape(g.supply_state)}) · Delivery: ${escape(g.delivery_address)}</p>${g.supplier_reference ? `<p>Supplier invoice: ${escape(g.supplier_reference)}</p>` : ''}<table><thead><tr><th>HSN/SAC</th><th>Rate %</th><th>Taxable</th><th>CGST</th><th>SGST/UTGST</th><th>IGST</th></tr></thead><tbody>${d.gst.lines.map((l) => `<tr><td>${escape(l.hsn_sac)}</td><td>${escape(decimal(BigInt(l.rate_bps)))}</td><td>${escape(money(l.taxable_minor, currency))}</td><td>${escape(money(l.cgst_minor, currency))}</td><td>${escape(money(l.sgst_minor, currency))}</td><td>${escape(money(l.igst_minor, currency))}</td></tr>`).join('')}</tbody></table><p>Taxable: ${escape(money(d.gst.taxable_minor, currency))} · CGST: ${escape(money(d.gst.cgst_minor, currency))} · SGST/UTGST: ${escape(money(d.gst.sgst_minor, currency))} · IGST: ${escape(money(d.gst.igst_minor, currency))}</p><p>Reverse charge: No · Supplier authorization/signature: __________________</p>`
+      ? `<h3>India GST invoice particulars</h3><p>Supplier: ${escape(isSale ? state.company!.name : party?.input.name || '')} · Registration: ${escape(isSale ? data.gst.gstin : g.counterparty_gstin || '')} · ${escape(isSale ? data.gst.address : g.counterparty_address)}</p><p>Recipient registration: ${escape(isSale ? g.counterparty_gstin || 'Unregistered' : data.gst.gstin)} · ${escape(isSale ? g.counterparty_address : data.gst.address)}</p><p>Place of supply: ${escape(g.supply_state_name)} (${escape(g.supply_state)}) · Delivery: ${escape(g.delivery_address)}</p>${g.supplier_reference ? `<p>Supplier invoice: ${escape(g.supplier_reference)}</p>` : ''}<table><thead><tr><th>HSN/SAC</th><th>Rate %</th><th>Taxable</th><th>CGST</th><th>SGST/UTGST</th><th>IGST</th></tr></thead><tbody>${d.gst.lines.map((l) => `<tr><td>${escape(l.hsn_sac)}</td><td>${escape(decimal(BigInt(l.rate_bps)))}</td><td>${escape(money(l.taxable_minor, currency))}</td><td>${escape(money(l.cgst_minor, currency))}</td><td>${escape(money(l.sgst_minor, currency))}</td><td>${escape(money(l.igst_minor, currency))}</td></tr>`).join('')}</tbody></table><p>Taxable: ${escape(money(d.gst.taxable_minor, currency))} · CGST: ${escape(money(d.gst.cgst_minor, currency))} · SGST/UTGST: ${escape(money(d.gst.sgst_minor, currency))} · IGST: ${escape(money(d.gst.igst_minor, currency))}</p><p>Reverse charge: No · Supplier authorization/signature: __________________</p>`
       : '';
-  const html = `<!doctype html><html lang="en"><meta charset="utf-8"><title>${escape(d.number)}</title><style>body{font:16px system-ui;color:#20372e;max-width:850px;margin:48px auto;padding:24px}table{width:100%;border-collapse:collapse;margin:32px 0}td,th{text-align:left;border-bottom:1px solid #ddd;padding:12px}small{color:#667}</style><h1>${escape(state.company!.name)}</h1><h2>${escape(docNames[d.input.kind])} ${escape(d.number)}</h2><p>${escape(d.input.date)}${d.input.due_date ? ` · Due ${escape(d.input.due_date)}` : ''}${d.reversed ? ' · REVERSED' : ''}</p><h3>${escape(party?.input.name || '')}</h3><p>${escape(party?.input.contact || '')}</p><table><thead><tr><th>Description</th><th>Quantity</th><th>Unit price</th><th>Amount</th></tr></thead><tbody>${d.input.lines.map((l) => `<tr><td>${escape(l.description)}</td><td>${escape(l.quantity)} ${escape(data.items.find((i) => i.id === l.item_id)?.input.unit || '')}</td><td>${escape(money(parseMinor(l.unit_price) || 0n, currency))}</td><td>${escape(money(lineTotal(l), currency))}</td></tr>`).join('')}</tbody></table>${gstHtml}<h3>Total ${escape(money(d.total_minor, currency))}</h3><p>${escape(d.input.note)}</p><small>${d.gst ? 'Open Ledger · Domestic regular GST accounting · Review legal particulars and supplier authorization before issue' : 'Open Ledger · General accounting document · No GST calculation'}</small></html>`;
+  const html = `<!doctype html><html lang="en"><meta charset="utf-8"><title>${escape(d.number)}</title><style>body{font:16px system-ui;color:#20372e;max-width:850px;margin:48px auto;padding:24px}table{width:100%;border-collapse:collapse;margin:32px 0}td,th{text-align:left;border-bottom:1px solid #ddd;padding:12px}small{color:#667}</style><h1>${escape(state.company!.name)}</h1><h2>${escape(docNames[d.input.kind])} ${escape(d.number)}</h2><p>${escape(d.input.date)}${d.input.due_date ? ` · Due ${escape(d.input.due_date)}` : ''}${d.reversed ? ' · REVERSED' : ''}</p><h3>${escape(party?.input.name || '')}</h3><p>${escape(party?.input.contact || '')}</p><table><thead><tr><th>Description</th><th>Quantity</th><th>Unit price</th><th>Amount</th></tr></thead><tbody>${(d.correction?.lines || d.input.lines).map((l) => `<tr><td>${escape(l.description)}</td><td>${escape(l.quantity)} ${escape(data.items.find((i) => i.id === l.item_id)?.input.unit || '')}</td><td>${escape(money(parseMinor(l.unit_price) || 0n, currency))}</td><td>${escape(money('taxable_minor' in l ? String(l.taxable_minor) : lineTotal(l), currency))}</td></tr>`).join('')}</tbody></table>${d.correction ? `<p>Linked original invoice: ${escape(d.correction.invoice_number)} · ${escape(d.correction.invoice_date)}</p><p>Amounts reduce the original invoice.${d.input.kind === 'debit_note' ? ' Purchase return notes record the buyer’s commercial adjustment; review the supplier’s statutory credit note separately.' : ''}</p>` : ''}${gstHtml}<h3>Total ${escape(money(d.total_minor, currency))}</h3><p>${escape(d.input.note)}</p><small>${d.gst ? 'Open Ledger · Domestic regular GST accounting · Review legal particulars and supplier authorization before issue' : 'Open Ledger · General accounting document · No GST calculation'}</small></html>`;
   if (print) {
     const frame = document.createElement('iframe');
     frame.className = 'print-frame';
@@ -2124,6 +2477,7 @@ function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) =
         date: string;
         event: string;
         sign: number;
+        original_invoice: string | null;
         counterparty_gstin: string | null;
         supply_state: string;
         amounts: GstCalculation;
@@ -2175,6 +2529,7 @@ function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) =
                   'Kind',
                   'Date',
                   'Event',
+                  'Original invoice',
                   'GSTIN',
                   'Place of supply',
                   'Line',
@@ -2191,6 +2546,7 @@ function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) =
                     r.kind,
                     r.date,
                     r.event,
+                    r.original_invoice || '',
                     r.counterparty_gstin || '',
                     r.supply_state,
                     index + 1,

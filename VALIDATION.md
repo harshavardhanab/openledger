@@ -1,5 +1,18 @@
 # Roadmap implementation validation — 15 October 2026
 
+## Returns and accessibility extension
+
+Current work extends the earlier candidate below with linked quantity returns/cancellation, customer/supplier refunds, original-cost sales stock returns, weighted-average purchase return variances, explicit GST-adjustment review, tax-register links, and schema/backup version 4 with versions 1–3 compatibility.
+
+- 44 locked Rust tests pass, including exact GST cancellation across repeated partial notes, stale valuation review rejection, over-return/backdating protection, supplier/customer refunds, tampered return backups, version 3 backup retries and transactional schema-4 rebuild rollback.
+- All 26 browser workflow executions pass across Chromium/WebKit, including invoice cancellation/refunds, stock returns, GST note review/register totals and backup recovery.
+- Automated WCAG A/AA scans pass for core pages, invoice/journal forms, empty setup and populated example books in Chromium and WebKit after correcting text contrast. Narrow 320-CSS-pixel reflow, forced-colors display and keyboard navigation checks pass in both engines. This does not replace an independent screen-reader/full accessibility audit.
+- The macOS ARM64 app builds (10.04 MiB), passes ad hoc signature verification and launched against a copy of the prior synthetic schema-3 profile, migrating it to schema 4. A native partial GST note was previewed and posted at 500.00 taxable + 45.00 CGST + 45.00 SGST, reducing the original receivable by 590.00. Additional native recovery checks are recorded after completion.
+- The installed-package matrix now includes an actual AppImage runtime launch with documented extract-and-run mode. Execution evidence for this extension is pending a fresh package/CI run; earlier candidate runs below do not validate changed application source.
+- Static inspection of the newly supplied installer found an unsigned wrapper containing opaque data, without establishing a genuine Tally identity/version or yielding an XML export fixture. No supplied executable or activation code was run. Local evidence stays in Git-ignored `.research/`; verified version-specific Tally imports remain pending.
+
+## Earlier roadmap candidate evidence
+
 Branch: `codex/roadmap-completion`, based on main commit `ad949af`. Application source candidate: `b19f798`. Later changes at `f114fe1` affect the Windows test runner only; application/dependency source is identical. Local platform: Apple Silicon macOS, Node.js 22.22.1, Rust 1.99.
 
 - Clean `npm ci` and locked Rust dependencies.
