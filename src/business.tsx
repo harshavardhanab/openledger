@@ -1186,7 +1186,18 @@ function DocumentComposer({
             {settlement && (
               <>
                 <AccountSelect
-                  accounts={state.accounts}
+                  accounts={state.accounts.filter(
+                    (a) =>
+                      !data.parties.some((p) => p.input.account_id === a.id) &&
+                      !data.items.some((i) => i.input.asset_account_id === a.id) &&
+                      !(
+                        data.gst &&
+                        [
+                          ...Object.values(data.gst.input),
+                          ...Object.values(data.gst.output),
+                        ].includes(a.id)
+                      ),
+                  )}
                   kinds={['asset']}
                   value={bank}
                   change={setBank}
@@ -1434,8 +1445,8 @@ function DocumentComposer({
             )}
           </div>
           <p className="form-hint">
-            Amounts use two decimal places. Stock uses perpetual weighted average cost. Taxes are
-            not calculated in this general accounting workflow.
+            Amounts use two decimal places. Stock uses perpetual weighted average cost. GST is
+            calculated when the supported India regular GST option is enabled.
           </p>
         </form>
       )}

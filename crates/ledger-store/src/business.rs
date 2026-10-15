@@ -449,6 +449,7 @@ fn prepare_document(
             .money_account_id
             .ok_or_else(|| invalid("Select a cash or bank account."))?;
         account_kind(tx, bank, &["asset"])?;
+        crate::gst::check_gst_control(tx, bank)?;
         let control: i64 =
             tx.query_row("SELECT account_id FROM parties WHERE id=?1", [party], |r| {
                 r.get(0)

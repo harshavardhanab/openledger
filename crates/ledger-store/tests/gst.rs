@@ -118,6 +118,10 @@ fn intrastate_sales_tax_is_a_liability_and_settlements_use_the_gross_amount() {
         lines: vec![],
         request_id: "gst-receipt".into(),
     };
+    let mut wrong_bank = payment.clone();
+    wrong_bank.money_account_id = Some(p.input.cgst);
+    wrong_bank.request_id = "bad-gst-bank".into();
+    assert!(s.post_document(wrong_bank).is_err());
     s.post_document(payment).unwrap();
     assert_eq!(
         s.business_state(0, 50, None)
