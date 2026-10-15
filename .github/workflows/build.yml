@@ -73,7 +73,8 @@ jobs:
         run: xvfb-run -a npm run test:desktop
       - name: Native desktop smoke tests (Windows)
         if: runner.os == 'Windows'
-        run: npm run test:desktop
+        shell: pwsh
+        run: ./scripts/native-windows.ps1
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

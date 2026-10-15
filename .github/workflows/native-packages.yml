@@ -85,7 +85,8 @@ jobs:
         run: xvfb-run -a node scripts/desktop-smoke.mjs
       - name: Native installed-package smoke (Windows)
         if: runner.os == 'Windows'
-        run: node scripts/desktop-smoke.mjs
+        shell: pwsh
+        run: ./scripts/native-windows.ps1
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
