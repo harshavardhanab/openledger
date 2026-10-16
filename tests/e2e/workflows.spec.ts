@@ -686,10 +686,39 @@ test('reviewed nil-rated, exempt and non-GST bills export separately and retain 
     await expect(
       page.getByText('Synthetic reviewed legal reference', { exact: false }),
     ).toBeVisible();
-    await page.getByRole('button', { name: 'Post sales invoice', exact: true }).click();
+    if (classification === 'nil_rated') {
+      let releasePost!: () => void;
+      const posting = new Promise<void>((resolve) => {
+        releasePost = resolve;
+      });
+      await page.route(
+        '**/api/post_document',
+        async (route) => {
+          await posting;
+          await route.continue();
+        },
+        { times: 1 },
+      );
+      await page.getByRole('button', { name: 'Post sales invoice', exact: true }).click();
+      try {
+        await expect(
+          page.getByRole('button', { name: 'New sales invoice', exact: true }),
+        ).toBeDisabled();
+        await expect(
+          page.getByRole('button', { name: 'New purchase invoice', exact: true }),
+        ).toBeDisabled();
+      } finally {
+        releasePost();
+      }
+    } else {
+      await page.getByRole('button', { name: 'Post sales invoice', exact: true }).click();
+    }
+    await expect(page.getByRole('button', { name: 'Post sales invoice', exact: true })).toHaveCount(
+      0,
+    );
     await expect(
       page.getByRole('button', { name: 'New sales invoice', exact: true }),
-    ).toBeVisible();
+    ).toBeEnabled();
   }
   await page.getByRole('button', { name: 'INV-000001', exact: true }).click();
   await expect(page.getByText('Nil-rated supply', { exact: true })).toBeVisible();
