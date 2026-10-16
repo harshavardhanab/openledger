@@ -94,7 +94,7 @@ jobs:
           printf '%s' "$RELEASE_GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --armor --detach-sign artifacts/SHA256SUMS
           gpg --verify artifacts/SHA256SUMS.asc artifacts/SHA256SUMS
           rm -rf "$GNUPGHOME"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: trusted-candidate-${{ runner.os }}-${{ runner.arch }}
           path: artifacts/
