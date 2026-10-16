@@ -30,7 +30,7 @@ See [accounting workflows](docs/ACCOUNTING.md) for posting rules and correction 
 
 ## Before a stable release
 
-- [x] Clean builds/packages on macOS ARM64, Windows x64 and Linux x64; macOS app-bundle manual checks and Windows NSIS/Debian installed-package checks. Exact source/run evidence and architecture limits are in VALIDATION.md. AppImage launch and broader desktop/GPU checks remain release follow-ups.
+- [x] Clean builds/packages on macOS ARM64, Windows x64 and Linux x64; macOS app-bundle manual checks and Windows NSIS/Debian/AppImage installed-package checks. AppImage runtime launch uses extract-and-run mode. Exact source/run evidence and architecture limits are in VALIDATION.md. Broader desktop/GPU checks remain release follow-ups.
 - [x] Automated browser end-to-end workflows for posting, reports, invoices, reversal, backup/restore and malformed restore rejection in Chromium and WebKit.
 - [x] Native Windows/Linux installed-package WebDriver smoke tests pass in CI; macOS native posting, GST, reports, export dialogs, reversal, backup/restore/recovery, malformed input, switching and restart checks pass for the documented candidate.
 - [x] Backup compatibility and transactional schema migration tests, interrupted-write recovery and recovery-backup drills.
