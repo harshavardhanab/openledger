@@ -2,7 +2,7 @@
 
 ## GST return-preparation extension
 
-The current extension adds monthly/quarterly draft GSTR-1 CSVs, GSTR-3B book worksheets, HSN review and six-account tax reconciliation. Local locked Rust tests (51 total), strict TypeScript/Vite and Clippy pass. Browser workflows now verify draft JSON/CSV contents, unresolved-period errors, WCAG scans and narrow reflow. The official offline template archive hash and precise scope are in [GST_RETURNS.md](docs/GST_RETURNS.md). New application source requires fresh platform CI and native-package evidence; the earlier candidate runs below do not validate this extension.
+The current extension adds monthly/quarterly draft GSTR-1 CSVs, GSTR-3B book worksheets, HSN review and six-account tax reconciliation. Local locked Rust tests (55 total), strict TypeScript/Vite and Clippy pass. Browser workflows now verify draft JSON/CSV contents, unresolved-period errors, WCAG scans and narrow reflow. The official offline template archive hash and precise scope are in [GST_RETURNS.md](docs/GST_RETURNS.md). The next extension adds nil-rated/exempt/non-GST sales and purchases, reviewed supplier state, bill-of-supply exports, EXEMP/GSTR-3B classifications and schema/backup version 5 with versions 1–4 compatibility. Targeted browser checks pass in Chromium/WebKit for classification, zero tax, printable exports, linked returns, draft totals and accessibility. New application source requires fresh platform CI and native-package evidence; the earlier candidate runs below do not validate this extension.
 
 ## Returns and accessibility extension — earlier source
 

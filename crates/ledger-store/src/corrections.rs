@@ -151,8 +151,13 @@ pub(crate) fn prepare_correction(
             "Returns must follow the original invoice and its latest settlement, return or reversal; reversed invoices cannot be returned.",
         ));
     }
-    if (orig.gst.is_some() && d.gst_adjustment_reviewed != Some(true))
-        || (orig.gst.is_none() && d.gst_adjustment_reviewed.is_some())
+    let tax_review = orig
+        .input
+        .gst
+        .as_ref()
+        .is_some_and(|g| g.classification.is_none());
+    if (tax_review && d.gst_adjustment_reviewed != Some(true))
+        || (!tax_review && d.gst_adjustment_reviewed.is_some())
     {
         return Err(invalid(
             "GST returns require explicit review of tax-adjustment eligibility and supporting supplier/recipient documents.",

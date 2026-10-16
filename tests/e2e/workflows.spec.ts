@@ -541,7 +541,7 @@ test('India GST setup, invoice tax and register work through the interface', asy
   await page.getByLabel('Description', { exact: true }).fill('Synthetic service');
   await page.getByLabel('Unit price', { exact: true }).fill('1000');
   await page.getByLabel('Posting account').selectOption('7');
-  await page.getByRole('checkbox', { name: 'Calculate India regular GST' }).check();
+  await page.getByRole('checkbox', { name: 'Record India tax details' }).check();
   await page.getByLabel('Counterparty postal address').fill('Synthetic recipient address');
   await page.getByLabel('Delivery address').fill('Synthetic service delivery address');
   await page.getByLabel('Reviewed GST rate (%)').fill('18');
@@ -638,4 +638,124 @@ test('experimental Tally XML mapping, preview and import work through the interf
   await page.getByRole('button', { name: 'Import mapped Tally vouchers', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Tally general vouchers imported');
   expect((await api(request, 'state')).journal_count).toBe(1);
+});
+
+test('reviewed nil-rated, exempt and non-GST bills export separately and retain linked returns', async ({
+  page,
+  request,
+}) => {
+  await company(page, request, 'Classified supplies UI');
+  const accounts = await api(request, 'gst_control_accounts');
+  await api(request, 'configure_gst', {
+    gstin: '29ABCDE1234F1Z5',
+    state_code: '29',
+    state_name: 'Karnataka',
+    address: 'Synthetic registered office',
+    ...accounts,
+  });
+  await api(request, 'create_party', {
+    name: 'Classified supply buyer',
+    kind: 'customer',
+    contact: '',
+    account_id: 3,
+  });
+  await page.reload();
+  await nav(page, 'Invoices & settlements');
+  for (const classification of ['nil_rated', 'exempt', 'non_gst']) {
+    await page.getByRole('button', { name: 'New sales invoice', exact: true }).click();
+    await page
+      .getByLabel('Customer', { exact: true })
+      .selectOption({ label: 'Classified supply buyer' });
+    await page
+      .getByLabel('Description', { exact: true })
+      .fill(`Reviewed ${classification} service`);
+    await page.getByLabel('Unit price', { exact: true }).fill('1000');
+    await page.getByLabel('Posting account').selectOption('7');
+    await page.getByRole('checkbox', { name: 'Record India tax details', exact: true }).check();
+    await page.getByLabel('Supply classification', { exact: true }).selectOption(classification);
+    await page
+      .getByLabel('Reviewed classification basis')
+      .fill('Synthetic reviewed legal reference');
+    await page.getByLabel('Counterparty postal address').fill('Synthetic recipient office');
+    await page.getByLabel('Delivery address').fill('Synthetic service address');
+    await page.getByLabel('HSN / SAC', { exact: true }).fill('998314');
+    await expect(page.getByLabel('Reviewed GST rate (%)', { exact: true })).toBeDisabled();
+    await page.getByRole('button', { name: 'Review document', exact: true }).click();
+    await expect(page.getByText('Total: ₹1,000.00', { exact: true })).toBeVisible();
+    await expect(
+      page.getByText('Synthetic reviewed legal reference', { exact: false }),
+    ).toBeVisible();
+    await page.getByRole('button', { name: 'Post sales invoice', exact: true }).click();
+    await expect(
+      page.getByRole('button', { name: 'New sales invoice', exact: true }),
+    ).toBeVisible();
+  }
+  await page.getByRole('button', { name: 'INV-000001', exact: true }).click();
+  await expect(page.getByText('Nil-rated supply', { exact: true })).toBeVisible();
+  const downloading = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export document (HTML)', exact: true }).click();
+  const exported = await downloading;
+  const html = readFileSync((await exported.path())!, 'utf8');
+  expect(html).toContain('Bill of supply');
+  expect(html).toContain('No GST charged.');
+  expect(html).toContain('Synthetic reviewed legal reference');
+  expect(html).not.toContain('<th>Rate %</th>');
+  const invoiceRow = page
+    .getByRole('row')
+    .filter({ has: page.getByRole('button', { name: 'INV-000001', exact: true }) });
+  await invoiceRow.getByRole('button', { name: 'Return / cancel', exact: true }).click();
+  await page.getByLabel('Return reason', { exact: true }).fill('Partial nil-rated return');
+  await page.getByLabel(/Return quantity 1:/).fill('0.5');
+  await expect(
+    page.getByRole('checkbox', { name: /I reviewed GST adjustment eligibility/ }),
+  ).toHaveCount(0);
+  await page.getByRole('button', { name: 'Review return', exact: true }).click();
+  await page.getByRole('button', { name: 'Post return note', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'CN-000001', exact: true })).toBeVisible();
+  await api(request, 'create_party', {
+    name: 'Exempt supplier',
+    kind: 'supplier',
+    contact: '',
+    account_id: 5,
+  });
+  await page.reload();
+  await nav(page, 'Invoices & settlements');
+  await page.getByRole('button', { name: 'New purchase invoice', exact: true }).click();
+  await page.getByLabel('Supplier', { exact: true }).selectOption({ label: 'Exempt supplier' });
+  await page.getByLabel('Description', { exact: true }).fill('Reviewed exempt purchase');
+  await page.getByLabel('Unit price', { exact: true }).fill('1000');
+  await page.getByLabel('Posting account').selectOption('8');
+  await page.getByRole('checkbox', { name: 'Record India tax details', exact: true }).check();
+  await page.getByLabel('Supply classification', { exact: true }).selectOption('exempt');
+  await page.getByLabel('Reviewed supplier state code').fill('27');
+  await page
+    .getByLabel('Reviewed classification basis')
+    .fill('Synthetic reviewed purchase exemption');
+  await page.getByLabel('Supplier document reference').fill('SUP-NIL-1');
+  await page.getByLabel('Counterparty postal address').fill('Synthetic Maharashtra supplier');
+  await page.getByLabel('Delivery address').fill('Synthetic Karnataka recipient');
+  await page.getByLabel('HSN / SAC', { exact: true }).fill('998314');
+  await expect(
+    page.getByRole('checkbox', { name: 'I independently reviewed input tax credit eligibility.' }),
+  ).toHaveCount(0);
+  await page.getByRole('button', { name: 'Review document', exact: true }).click();
+  await page.getByRole('button', { name: 'Post purchase invoice', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'BILL-000001', exact: true })).toBeVisible();
+  await nav(page, 'Financial statements');
+  await page.getByRole('button', { name: 'Prepare GST return draft', exact: true }).click();
+  const downloadingDraft = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export complete GST draft (JSON)', exact: true }).click();
+  const file = await downloadingDraft;
+  const draft = JSON.parse(readFileSync((await file.path())!, 'utf8'));
+  expect(draft.gstr3b_book_3_1_a.taxable_minor).toBe('0');
+  expect(draft.gstr3b_book_3_1_c.taxable_minor).toBe('150000');
+  expect(draft.gstr3b_book_3_1_e.taxable_minor).toBe('100000');
+  expect(draft.gstr1_sections.exemp.taxable_minor).toBe('250000');
+  expect(draft.gstr3b_book_5[0].inter_state_minor).toBe('100000');
+  expect(draft.gstr3b_book_4_a_5.igst_minor).toBe('0');
+  expect(draft.issues).toEqual([]);
+  expect(
+    (await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze())
+      .violations,
+  ).toEqual([]);
 });

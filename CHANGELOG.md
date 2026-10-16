@@ -3,6 +3,7 @@
 ## Unreleased roadmap implementation
 
 - Customers and suppliers; exact sales/purchase invoices and linked partial settlements.
+- Explicit nil-rated/exempt/non-GST sales and purchases, reviewed classification/supplier state, bill-of-supply exports and classified return/draft reporting.
 - Monthly/quarterly GST draft preparation: GSTR-1 candidate CSVs, GSTR-3B book worksheet, HSN review and GST-control reconciliation with unresolved source/rounding items.
 - India GST registration, reviewed per-line rates/HSN, component tax postings, reviewed purchase ITC and register exports.
 - Linked partial/full invoice returns, stock cost restoration/variance, explicit GST-adjustment review and customer/supplier refunds.
@@ -10,7 +11,7 @@
 - Fractional inventory, perpetual weighted average costing and paginated movement history.
 - Profit/loss and balance sheet reports, bank reconciliation, period closing and carry-forward.
 - Separate company/example files with persistent switching and locale preferences.
-- Schema/backup version 4 with version 1/2/3 compatibility, linked-record validation and stable posting-line IDs.
+- Schema/backup version 5 with version 1/2/3/4 compatibility, linked-record validation and stable posting-line IDs.
 - Experimental Tally XML general-voucher adapter with mapping, preview, staged commit and defensive parsing.
 - Atomic journal batch imports; paginated lists and large-book regression.
 - WCAG automated page/form checks, stronger contrast, forced colors, skip navigation and narrow reflow/keyboard checks.

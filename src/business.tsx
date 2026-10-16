@@ -48,6 +48,7 @@ type GstProfile = {
   input: GstAccounts;
 };
 type GstInput = {
+  classification?: { kind: string; reason: string; supplier_state?: string };
   supply_state: string;
   supply_state_name: string;
   counterparty_gstin: string | null;
@@ -477,6 +478,7 @@ function Documents(
           ) : (
             <DocumentLines lines={detail.input.lines} currency={currency} />
           )}
+          <SupplyClass gst={detail.input.gst || detail.correction?.original_gst} />
           {detail.gst && <GstAmounts calc={detail.gst} currency={currency} />}
           <p>{detail.input.note}</p>
           <strong>Total: {money(detail.total_minor, currency)}</strong>
@@ -834,7 +836,9 @@ function ReturnComposer({
               amount: null,
               note: reason,
               lines: [],
-              ...(invoice.gst ? { gst_adjustment_reviewed: taxReviewed } : {}),
+              ...(invoice.gst && !invoice.input.gst?.classification
+                ? { gst_adjustment_reviewed: taxReviewed }
+                : {}),
               return_lines: quantities.flatMap((quantity, line) =>
                 quantity.trim() && Number(quantity) !== 0 ? [{ line, quantity }] : [],
               ),
@@ -872,7 +876,7 @@ function ReturnComposer({
               />
             </Field>
           </div>
-          {invoice.gst && (
+          {invoice.gst && !invoice.input.gst?.classification && (
             <label className="checkbox-label">
               <input
                 type="checkbox"
@@ -956,6 +960,9 @@ function DocumentComposer({
   const patch = (i: number, p: Partial<ComposerLine>) =>
     setLines((v) => v.map((l, n) => (i === n ? { ...l, ...p } : l)));
   const [gstEnabled, setGstEnabled] = useState(false),
+    [supplyKind, setSupplyKind] = useState('regular'),
+    [classificationBasis, setClassificationBasis] = useState(''),
+    [supplierState, setSupplierState] = useState(data.gst?.state_code || ''),
     [supplyState, setSupplyState] = useState(data.gst?.state_code || ''),
     [supplyName, setSupplyName] = useState(data.gst?.state_name || ''),
     [gstin, setGstin] = useState(''),
@@ -964,14 +971,25 @@ function DocumentComposer({
     [supplierRef, setSupplierRef] = useState(''),
     [creditReviewed, setCreditReviewed] = useState(false);
   const gstInput: GstInput = {
+    ...(supplyKind !== 'regular'
+      ? {
+          classification: {
+            kind: supplyKind,
+            reason: classificationBasis,
+            ...(kind === 'purchase' ? { supplier_state: supplierState } : {}),
+          },
+        }
+      : {}),
     supply_state: supplyState,
     supply_state_name: supplyName,
     counterparty_gstin: gstin || null,
     counterparty_address: taxAddress,
     delivery_address: delivery,
     supplier_reference: kind === 'purchase' ? supplierRef : null,
-    credit_reviewed: kind === 'purchase' ? creditReviewed : false,
-    rates_bps: lines.map((l) => Number(parseMinor(l.gst_rate || '') || 0n)),
+    credit_reviewed: kind === 'purchase' && supplyKind === 'regular' ? creditReviewed : false,
+    rates_bps: lines.map((l) =>
+      supplyKind === 'regular' ? Number(parseMinor(l.gst_rate || '') || 0n) : 0,
+    ),
     hsn_sac: lines.map((l) => l.hsn_sac || ''),
   };
   const gstPreview = () => {
@@ -980,7 +998,7 @@ function DocumentComposer({
     const local = (kind === 'sale' ? data.gst?.state_code : gstin.slice(0, 2)) === supplyState;
     for (const l of lines) {
       const base = lineTotal(l),
-        rate = parseMinor(l.gst_rate || '') || 0n;
+        rate = supplyKind === 'regular' ? parseMinor(l.gst_rate || '') || 0n : 0n;
       if (local) c += (base * rate + 10000n) / 20000n;
       else i += (base * rate + 5000n) / 10000n;
     }
@@ -1057,6 +1075,9 @@ function DocumentComposer({
       );
       setGstEnabled(Boolean(d.gst));
       if (d.gst) {
+        setSupplyKind(d.gst.classification?.kind || 'regular');
+        setClassificationBasis(d.gst.classification?.reason || '');
+        setSupplierState(d.gst.classification?.supplier_state || data.gst?.state_code || '');
         setSupplyState(d.gst.supply_state);
         setSupplyName(d.gst.supply_state_name);
         setGstin(d.gst.counterparty_gstin || '');
@@ -1083,6 +1104,19 @@ function DocumentComposer({
       </div>
       {review ? (
         <>
+          {gstEnabled && supplyKind !== 'regular' && (
+            <p>
+              <strong>
+                {kind === 'purchase'
+                  ? 'Classified purchase record'
+                  : supplyKind === 'non_gst'
+                    ? 'Non-GST invoice'
+                    : 'Bill of supply'}{' '}
+                · {supplyKind.replace('_', ' ')}
+              </strong>{' '}
+              · Reviewed basis: {classificationBasis}
+            </p>
+          )}
           <p>Review before posting. Posted documents are immutable.</p>
           <p>
             {displayDate(date)} · {data.parties.find((p) => p.id === party)?.input.name}{' '}
@@ -1240,12 +1274,48 @@ function DocumentComposer({
                   checked={gstEnabled}
                   onChange={(e) => setGstEnabled(e.target.checked)}
                 />
-                Calculate India regular GST
+                Record India tax details
               </label>
               {gstEnabled && (
                 <fieldset className="document-line">
-                  <legend>Domestic GST particulars</legend>
+                  <legend>Domestic tax particulars</legend>
                   <div className="business-grid">
+                    {(kind === 'sale' || kind === 'purchase') && (
+                      <>
+                        <Field name="Supply classification">
+                          <select
+                            value={supplyKind}
+                            onChange={(e) => setSupplyKind(e.target.value)}
+                          >
+                            <option value="regular">Regular taxable supply</option>
+                            <option value="nil_rated">Nil-rated supply</option>
+                            <option value="exempt">Exempt supply</option>
+                            <option value="non_gst">Non-GST supply</option>
+                          </select>
+                        </Field>
+                        {supplyKind !== 'regular' && kind === 'purchase' && (
+                          <Field name="Reviewed supplier state code">
+                            <input
+                              required
+                              maxLength={2}
+                              value={supplierState}
+                              onChange={(e) => setSupplierState(e.target.value)}
+                            />
+                          </Field>
+                        )}
+                        {supplyKind !== 'regular' && (
+                          <Field name="Reviewed classification basis">
+                            <input
+                              required
+                              maxLength={500}
+                              value={classificationBasis}
+                              onChange={(e) => setClassificationBasis(e.target.value)}
+                              placeholder="Reviewed notification or legal basis"
+                            />
+                          </Field>
+                        )}
+                      </>
+                    )}
                     <Field name="Place of supply state code">
                       <input
                         required
@@ -1266,7 +1336,7 @@ function DocumentComposer({
                       name={kind === 'sale' ? 'Recipient GSTIN (if registered)' : 'Supplier GSTIN'}
                     >
                       <input
-                        required={kind === 'purchase'}
+                        required={kind === 'purchase' && supplyKind === 'regular'}
                         maxLength={15}
                         value={gstin}
                         onChange={(e) => setGstin(e.target.value.toUpperCase())}
@@ -1289,7 +1359,13 @@ function DocumentComposer({
                       />
                     </Field>
                     {kind === 'purchase' && (
-                      <Field name="Supplier tax invoice reference">
+                      <Field
+                        name={
+                          supplyKind === 'regular'
+                            ? 'Supplier tax invoice reference'
+                            : 'Supplier document reference'
+                        }
+                      >
                         <input
                           required
                           maxLength={16}
@@ -1299,7 +1375,7 @@ function DocumentComposer({
                       </Field>
                     )}
                   </div>
-                  {kind === 'purchase' && (
+                  {kind === 'purchase' && supplyKind === 'regular' && (
                     <label className="checkbox-label">
                       <input
                         required
@@ -1365,7 +1441,8 @@ function DocumentComposer({
                           <input
                             required
                             inputMode="decimal"
-                            value={l.gst_rate || ''}
+                            value={supplyKind === 'regular' ? l.gst_rate || '' : '0.00'}
+                            disabled={supplyKind !== 'regular'}
                             onChange={(e) => patch(i, { gst_rate: e.target.value })}
                           />
                         </Field>
@@ -2340,11 +2417,23 @@ function exportDocument(d: Doc, data: Business, state: Snapshot, print = false) 
   const currency = state.company!.currency;
   const g = d.input.gst || d.correction?.original_gst;
   const isSale = ['sale', 'credit_note'].includes(d.input.kind);
+  const classified = g?.classification;
+  const documentTitle =
+    d.input.kind === 'sale' && classified
+      ? classified.kind === 'non_gst'
+        ? 'Non-GST invoice'
+        : 'Bill of supply'
+      : docNames[d.input.kind];
+  const taxDetails = d.gst
+    ? classified
+      ? `<p>Supply classification: ${escape(classified.kind.replace('_', ' '))} · Reviewed basis: ${escape(classified.reason)}</p><table><thead><tr><th>HSN/SAC</th><th>Value of supply</th></tr></thead><tbody>${d.gst.lines.map((l) => `<tr><td>${escape(l.hsn_sac)}</td><td>${escape(money(l.taxable_minor, currency))}</td></tr>`).join('')}</tbody></table><p>No GST charged.</p>`
+      : `<table><thead><tr><th>HSN/SAC</th><th>Rate %</th><th>Taxable</th><th>CGST</th><th>SGST/UTGST</th><th>IGST</th></tr></thead><tbody>${d.gst.lines.map((l) => `<tr><td>${escape(l.hsn_sac)}</td><td>${escape(decimal(BigInt(l.rate_bps)))}</td><td>${escape(money(l.taxable_minor, currency))}</td><td>${escape(money(l.cgst_minor, currency))}</td><td>${escape(money(l.sgst_minor, currency))}</td><td>${escape(money(l.igst_minor, currency))}</td></tr>`).join('')}</tbody></table><p>Taxable: ${escape(money(d.gst.taxable_minor, currency))} · CGST: ${escape(money(d.gst.cgst_minor, currency))} · SGST/UTGST: ${escape(money(d.gst.sgst_minor, currency))} · IGST: ${escape(money(d.gst.igst_minor, currency))}</p>`
+    : '';
   const gstHtml =
     d.gst && g && data.gst
-      ? `<h3>India GST invoice particulars</h3><p>Supplier: ${escape(isSale ? state.company!.name : party?.input.name || '')} · Registration: ${escape(isSale ? data.gst.gstin : g.counterparty_gstin || '')} · ${escape(isSale ? data.gst.address : g.counterparty_address)}</p><p>Recipient registration: ${escape(isSale ? g.counterparty_gstin || 'Unregistered' : data.gst.gstin)} · ${escape(isSale ? g.counterparty_address : data.gst.address)}</p><p>Place of supply: ${escape(g.supply_state_name)} (${escape(g.supply_state)}) · Delivery: ${escape(g.delivery_address)}</p>${g.supplier_reference ? `<p>Supplier invoice: ${escape(g.supplier_reference)}</p>` : ''}<table><thead><tr><th>HSN/SAC</th><th>Rate %</th><th>Taxable</th><th>CGST</th><th>SGST/UTGST</th><th>IGST</th></tr></thead><tbody>${d.gst.lines.map((l) => `<tr><td>${escape(l.hsn_sac)}</td><td>${escape(decimal(BigInt(l.rate_bps)))}</td><td>${escape(money(l.taxable_minor, currency))}</td><td>${escape(money(l.cgst_minor, currency))}</td><td>${escape(money(l.sgst_minor, currency))}</td><td>${escape(money(l.igst_minor, currency))}</td></tr>`).join('')}</tbody></table><p>Taxable: ${escape(money(d.gst.taxable_minor, currency))} · CGST: ${escape(money(d.gst.cgst_minor, currency))} · SGST/UTGST: ${escape(money(d.gst.sgst_minor, currency))} · IGST: ${escape(money(d.gst.igst_minor, currency))}</p><p>Reverse charge: No · Supplier authorization/signature: __________________</p>`
+      ? `<h3>${classified ? 'Supply particulars' : 'India GST invoice particulars'}</h3><p>Supplier: ${escape(isSale ? state.company!.name : party?.input.name || '')} · Registration: ${escape(isSale ? data.gst.gstin : g.counterparty_gstin || '')} · ${escape(isSale ? data.gst.address : g.counterparty_address)}</p><p>Recipient registration: ${escape(isSale ? g.counterparty_gstin || 'Unregistered' : data.gst.gstin)} · ${escape(isSale ? g.counterparty_address : data.gst.address)}</p><p>Place of supply: ${escape(g.supply_state_name)} (${escape(g.supply_state)}) · Delivery: ${escape(g.delivery_address)}</p>${g.supplier_reference ? `<p>Supplier invoice: ${escape(g.supplier_reference)}</p>` : ''}${taxDetails}<p>Reverse charge: No · Supplier authorization/signature: __________________</p>`
       : '';
-  const html = `<!doctype html><html lang="en"><meta charset="utf-8"><title>${escape(d.number)}</title><style>body{font:16px system-ui;color:#20372e;max-width:850px;margin:48px auto;padding:24px}table{width:100%;border-collapse:collapse;margin:32px 0}td,th{text-align:left;border-bottom:1px solid #ddd;padding:12px}small{color:#667}</style><h1>${escape(state.company!.name)}</h1><h2>${escape(docNames[d.input.kind])} ${escape(d.number)}</h2><p>${escape(d.input.date)}${d.input.due_date ? ` · Due ${escape(d.input.due_date)}` : ''}${d.reversed ? ' · REVERSED' : ''}</p><h3>${escape(party?.input.name || '')}</h3><p>${escape(party?.input.contact || '')}</p><table><thead><tr><th>Description</th><th>Quantity</th><th>Unit price</th><th>Amount</th></tr></thead><tbody>${(d.correction?.lines || d.input.lines).map((l) => `<tr><td>${escape(l.description)}</td><td>${escape(l.quantity)} ${escape(data.items.find((i) => i.id === l.item_id)?.input.unit || '')}</td><td>${escape(money(parseMinor(l.unit_price) || 0n, currency))}</td><td>${escape(money('taxable_minor' in l ? String(l.taxable_minor) : lineTotal(l), currency))}</td></tr>`).join('')}</tbody></table>${d.correction ? `<p>Linked original invoice: ${escape(d.correction.invoice_number)} · ${escape(d.correction.invoice_date)}</p><p>Amounts reduce the original invoice.${d.input.kind === 'debit_note' ? ' Purchase return notes record the buyer’s commercial adjustment; review the supplier’s statutory credit note separately.' : ''}</p>` : ''}${gstHtml}<h3>Total ${escape(money(d.total_minor, currency))}</h3><p>${escape(d.input.note)}</p><small>${d.gst ? 'Open Ledger · Domestic regular GST accounting · Review legal particulars and supplier authorization before issue' : 'Open Ledger · General accounting document · No GST calculation'}</small></html>`;
+  const html = `<!doctype html><html lang="en"><meta charset="utf-8"><title>${escape(d.number)}</title><style>body{font:16px system-ui;color:#20372e;max-width:850px;margin:48px auto;padding:24px}table{width:100%;border-collapse:collapse;margin:32px 0}td,th{text-align:left;border-bottom:1px solid #ddd;padding:12px}small{color:#667}</style><h1>${escape(state.company!.name)}</h1><h2>${escape(documentTitle)} ${escape(d.number)}</h2><p>${escape(d.input.date)}${d.input.due_date ? ` · Due ${escape(d.input.due_date)}` : ''}${d.reversed ? ' · REVERSED' : ''}</p><h3>${escape(party?.input.name || '')}</h3><p>${escape(party?.input.contact || '')}</p><table><thead><tr><th>Description</th><th>Quantity</th><th>Unit price</th><th>Amount</th></tr></thead><tbody>${(d.correction?.lines || d.input.lines).map((l) => `<tr><td>${escape(l.description)}</td><td>${escape(l.quantity)} ${escape(data.items.find((i) => i.id === l.item_id)?.input.unit || '')}</td><td>${escape(money(parseMinor(l.unit_price) || 0n, currency))}</td><td>${escape(money('taxable_minor' in l ? String(l.taxable_minor) : lineTotal(l), currency))}</td></tr>`).join('')}</tbody></table>${d.correction ? `<p>Linked original invoice: ${escape(d.correction.invoice_number)} · ${escape(d.correction.invoice_date)}</p><p>Amounts reduce the original invoice.${d.input.kind === 'debit_note' ? ' Purchase return notes record the buyer’s commercial adjustment; review the supplier’s statutory credit note separately.' : ''}</p>` : ''}${gstHtml}<h3>Total ${escape(money(d.total_minor, currency))}</h3><p>${escape(d.input.note)}</p><small>${d.gst ? 'Open Ledger · India tax accounting · Review legal particulars and supplier authorization before issue' : 'Open Ledger · General accounting document · No GST calculation'}</small></html>`;
   if (print) {
     const frame = document.createElement('iframe');
     frame.className = 'print-frame';
@@ -2359,11 +2448,26 @@ function exportDocument(d: Doc, data: Business, state: Snapshot, print = false) 
   } else download(`${d.number.replace(/[^a-z0-9_-]/gi, '_')}.html`, html, 'text/html');
 }
 
+function SupplyClass({ gst }: { gst?: GstInput | null }) {
+  if (!gst?.classification) return null;
+  return (
+    <p>
+      <strong>
+        {gst.classification.kind === 'non_gst'
+          ? 'Non-GST supply'
+          : gst.classification.kind === 'nil_rated'
+            ? 'Nil-rated supply'
+            : 'Exempt supply'}
+      </strong>{' '}
+      · Reviewed basis: {gst.classification.reason}
+    </p>
+  );
+}
 function GstAmounts({ calc, currency }: { calc: GstCalculation; currency: string }) {
   return (
     <div className="ledger-summary">
       {[
-        ['Taxable', calc.taxable_minor],
+        ['Value before tax', calc.taxable_minor],
         ['CGST', calc.cgst_minor],
         ['SGST / UTGST', calc.sgst_minor],
         ['IGST', calc.igst_minor],
@@ -2509,6 +2613,8 @@ function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) =
         event: string;
         sign: number;
         original_invoice: string | null;
+        classification: string;
+        classification_basis: string | null;
         counterparty_gstin: string | null;
         supply_state: string;
         amounts: GstCalculation;
@@ -2561,6 +2667,8 @@ function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) =
                   'Date',
                   'Event',
                   'Original invoice',
+                  'Supply classification',
+                  'Classification basis',
                   'GSTIN',
                   'Place of supply',
                   'Line',
@@ -2578,6 +2686,8 @@ function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) =
                     r.date,
                     r.event,
                     r.original_invoice || '',
+                    r.classification,
+                    r.classification_basis || '',
                     r.counterparty_gstin || '',
                     r.supply_state,
                     index + 1,
@@ -2602,7 +2712,7 @@ function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) =
           <thead>
             <tr>
               <th>Type</th>
-              <th>Taxable</th>
+              <th>Value before tax</th>
               <th>CGST</th>
               <th>SGST / UTGST</th>
               <th>IGST</th>

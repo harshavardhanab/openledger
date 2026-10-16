@@ -24,6 +24,7 @@ See [accounting workflows](docs/ACCOUNTING.md) for posting rules and correction 
 - [x] Inventory invoice credit/debit notes and cancellation with linked stock returns, exact proportional credits, reviewed valuation and linked customer/supplier refunds. See [returns](docs/RETURNS.md) and [#5](https://github.com/harshavardhanab/openledger/issues/5).
 - [x] Scoped India regular GST specification, reviewed rates/HSN, exact CGST/SGST-or-UTGST/IGST postings and an accounting register. See [India GST scope](docs/INDIA_GST.md).
 - [x] Monthly/quarterly GST return preparation with draft GSTR-1 candidate CSVs, GSTR-3B book worksheets, HSN review, control reconciliation and explicit unresolved items. See [return preparation](docs/GST_RETURNS.md).
+- [x] Explicit nil-rated/exempt/non-GST sales and purchases with review basis, bill-of-supply exports, classified returns, EXEMP and GSTR-3B 3.1(c/e)/table 5 book worksheets.
 - [ ] Independent India tax verification, statutory return payloads/filing and special tax workflows outside that scope. Tracked in [#3](https://github.com/harshavardhanab/openledger/issues/3).
 - [x] Documented native import/export formats and atomic journal-import preview/commit.
 - [x] Separately designed, experimental Tally general-voucher XML adapter with explicit mapping, preview, atomic commit, stable source IDs and rejection of unsupported data. See [import/export contracts](docs/IMPORT_EXPORT.md).

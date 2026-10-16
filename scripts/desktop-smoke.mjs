@@ -191,8 +191,76 @@ try {
   assert.equal(returned.credited_minor, '3000');
   assert.equal(returned.outstanding_minor, '0');
   assert.equal((await invoke('returnable_invoice', { id: invoice.id })).remaining_milli[0], '0');
+  const controls = await invoke('gst_control_accounts');
+  await invoke('configure_gst', {
+    gstin: '29ABCDE1234F1Z5',
+    state_code: '29',
+    state_name: 'Karnataka',
+    address: 'Synthetic native test office',
+    ...controls,
+  });
+  const gst = {
+    supply_state: '29',
+    supply_state_name: 'Karnataka',
+    counterparty_gstin: null,
+    counterparty_address: 'Synthetic recipient office',
+    delivery_address: 'Synthetic service address',
+    supplier_reference: null,
+    credit_reviewed: false,
+    rates_bps: [1800],
+    hsn_sac: ['998314'],
+  };
+  await invoke('post_document', {
+    ...invoiceInput,
+    date: '2026-10-04',
+    due_date: '2026-10-04',
+    gst,
+    lines: [
+      {
+        description: 'Taxable service',
+        quantity: '1',
+        unit_price: '100',
+        account_id: 7,
+        item_id: null,
+      },
+    ],
+    request_id: 'native-taxable',
+  });
+  await invoke('post_document', {
+    ...invoiceInput,
+    date: '2026-10-04',
+    due_date: '2026-10-04',
+    gst: {
+      ...gst,
+      rates_bps: [0],
+      classification: { kind: 'exempt', reason: 'Synthetic reviewed exemption basis' },
+    },
+    lines: [
+      {
+        description: 'Exempt service',
+        quantity: '1',
+        unit_price: '50',
+        account_id: 7,
+        item_id: null,
+      },
+    ],
+    request_id: 'native-exempt',
+  });
+  const taxDraft = await invoke('gst_return_draft', { period: '2026-10', frequency: 'monthly' });
+  assert.equal(taxDraft.gstr3b_book_3_1_a.taxable_minor, '10000');
+  assert.equal(taxDraft.gstr3b_book_3_1_c.taxable_minor, '5000');
+  assert.equal(taxDraft.gstr1_sections.exemp.taxable_minor, '5000');
+  assert.equal(taxDraft.reconciled, true);
+  assert.equal(taxDraft.filing_ready, false);
+  const classifiedBackup = await invoke('backup');
+  assert.equal(JSON.parse(classifiedBackup).version, 5);
+  await invoke('restore_backup', { contents: classifiedBackup });
+  assert.deepEqual(
+    await invoke('gst_return_draft', { period: '2026-10', frequency: 'monthly' }),
+    taxDraft,
+  );
   console.log(
-    'Native IPC, rendered reports, posting, reversal, backup, restore, malformed restore, linked return and refund checks passed.',
+    'Native IPC, rendered reports, posting, reversal, backup, restore, malformed restore, linked returns/refunds and GST classification/draft/reconciliation checks passed.',
   );
 } catch (error) {
   if (session) {

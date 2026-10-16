@@ -19,7 +19,10 @@ type Draft = {
   gstr1_sections: Record<string, Amounts>;
   gstr1_rows: { section: string }[];
   gstr3b_book_3_1_a: Amounts;
+  gstr3b_book_3_1_c: Amounts;
+  gstr3b_book_3_1_e: Amounts;
   gstr3b_book_4_a_5: Amounts;
+  gstr3b_book_5: { category: string; inter_state_minor: string; intra_state_minor: string }[];
   gstr3b_book_3_2_unregistered: Record<string, Amounts>;
   reconciliation: {
     direction: string;
@@ -132,6 +135,8 @@ export function GstReturns({ state }: { state: Snapshot }) {
           <AmountTable
             rows={[
               { label: '3.1(a) · Outward taxable supplies', ...draft.gstr3b_book_3_1_a },
+              { label: '3.1(c) · Nil-rated / exempt outward supplies', ...draft.gstr3b_book_3_1_c },
+              { label: '3.1(e) · Non-GST outward supplies', ...draft.gstr3b_book_3_1_e },
               {
                 label: '4(A)(5) · Book input credit before GSTR-2B/IMS review',
                 ...draft.gstr3b_book_4_a_5,
@@ -143,6 +148,27 @@ export function GstReturns({ state }: { state: Snapshot }) {
               })),
             ]}
           />
+          <h4>GSTR-3B table 5 · Classified inward supplies</h4>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Category</th>
+                  <th>Inter-state</th>
+                  <th>Intra-state</th>
+                </tr>
+              </thead>
+              <tbody>
+                {draft.gstr3b_book_5.map((r) => (
+                  <tr key={r.category}>
+                    <td>{r.category}</td>
+                    <td>{money(r.inter_state_minor, 'INR')}</td>
+                    <td>{money(r.intra_state_minor, 'INR')}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
           <h4>GST control reconciliation</h4>
           <div className="table-scroll">
             <table>
@@ -251,7 +277,7 @@ function AmountTable({ rows }: { rows: (Amounts & { label: string })[] }) {
         <thead>
           <tr>
             <th>Section</th>
-            <th>Taxable</th>
+            <th>Supply / taxable value</th>
             <th>CGST</th>
             <th>SGST / UTGST</th>
             <th>IGST</th>

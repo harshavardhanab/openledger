@@ -22,7 +22,17 @@ pub struct GstProfile {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct SupplyClassification {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supplier_state: Option<String>,
+    pub kind: String,
+    pub reason: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GstInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<SupplyClassification>,
     pub supply_state: String,
     pub supply_state_name: String,
     pub counterparty_gstin: Option<String>,
@@ -134,6 +144,26 @@ pub(crate) fn calculate_gst(
     let Some(g) = &d.gst else {
         return Ok(None);
     };
+    if let Some(c) = &g.classification {
+        if !["sale", "purchase"].contains(&d.kind.as_str())
+            || !["nil_rated", "exempt", "non_gst"].contains(&c.kind.as_str())
+        {
+            return Err(invalid(
+                "Select a supported nil-rated, exempt or non-GST classification.",
+            ));
+        }
+        clean_text(&c.reason, "Reviewed classification basis", 500, true)?;
+        if d.kind == "sale" && c.supplier_state.is_some() {
+            return Err(invalid(
+                "Sales use the configured supplier registration state.",
+            ));
+        }
+        if d.kind == "purchase" && !c.supplier_state.as_deref().is_some_and(valid_state) {
+            return Err(invalid(
+                "Classified purchases require the reviewed supplier state code.",
+            ));
+        }
+    }
     if !["sale", "purchase"].contains(&d.kind.as_str()) {
         return Err(invalid("GST applies only to sales or purchase invoices."));
     }
@@ -168,9 +198,12 @@ pub(crate) fn calculate_gst(
         }
         p.state_code.clone()
     } else {
-        if !g.credit_reviewed || g.supply_state != p.state_code {
+        if (g.classification.is_none() && !g.credit_reviewed)
+            || (g.classification.is_some() && g.credit_reviewed)
+            || g.supply_state != p.state_code
+        {
             return Err(invalid(
-                "This purchase workflow supports independently reviewed eligible ITC for the company's registered state only.",
+                "Purchases require place of supply in the company's registered state. Review eligible ITC only for regular taxable purchases; classified zero-tax purchases cannot claim ITC.",
             ));
         }
         let reference = g
@@ -182,10 +215,24 @@ pub(crate) fn calculate_gst(
                 "Supplier tax invoice reference must have 1–16 invoice-number characters.",
             ));
         }
-        g.counterparty_gstin
-            .as_ref()
-            .ok_or_else(|| invalid("A purchase GST invoice requires the supplier's GSTIN."))?[..2]
-            .into()
+        if let Some(c) = &g.classification {
+            let state = c.supplier_state.as_deref().unwrap();
+            if g.counterparty_gstin
+                .as_ref()
+                .is_some_and(|id| !id.starts_with(state))
+            {
+                return Err(invalid(
+                    "Reviewed supplier state must match the supplier GSTIN.",
+                ));
+            }
+            state.into()
+        } else {
+            g.counterparty_gstin
+                .as_ref()
+                .ok_or_else(|| invalid("A purchase GST invoice requires the supplier's GSTIN."))?
+                [..2]
+                .into()
+        }
     };
     let local = supplier_state == g.supply_state;
     let mut total = (0i128, 0i128, 0i128, 0i128);
@@ -194,12 +241,15 @@ pub(crate) fn calculate_gst(
         check_gst_control(tx, l.account_id)?;
         let rate = g.rates_bps[i];
         let code = &g.hsn_sac[i];
-        if !(1..=10000).contains(&rate)
-            || ![4, 6, 8].contains(&code.len())
+        if (if g.classification.is_some() {
+            rate != 0
+        } else {
+            !(1..=10000).contains(&rate)
+        }) || ![4, 6, 8].contains(&code.len())
             || !code.bytes().all(|b| b.is_ascii_digit())
         {
             return Err(invalid(
-                "GST rates must be positive percentages up to 100, with two decimals; HSN/SAC must contain 4, 6 or 8 digits. Verify the rate and code for the supply.",
+                "Regular GST rates must be positive percentages up to 100, with two decimals; classified nil-rated/exempt/non-GST supplies must use zero. HSN/SAC must contain 4, 6 or 8 digits. Verify the classification, rate and code independently.",
             ));
         }
         let qty = crate::parse_quantity(&l.quantity)?;
@@ -366,7 +416,7 @@ impl LedgerStore {
                         .igst_minor
                         .parse::<i128>()
                         .map_err(|_| invalid("Invalid stored GST."))?;
-                rows.push(serde_json::json!({"document_id":d.id,"number":d.number,"original_invoice":source.as_ref().map(|s| &s.number),"supplier_reference":g.supplier_reference,"kind":d.input.kind,"date":date,"event":event,"sign":sign,"counterparty_gstin":g.counterparty_gstin,"supply_state":g.supply_state,"supply_state_name":g.supply_state_name,"amounts":calc}));
+                rows.push(serde_json::json!({"document_id":d.id,"number":d.number,"original_invoice":source.as_ref().map(|s| &s.number),"supplier_reference":g.supplier_reference,"kind":d.input.kind,"classification":g.classification.as_ref().map(|c|c.kind.as_str()).unwrap_or("regular"),"classification_basis":g.classification.as_ref().map(|c|c.reason.as_str()),"date":date,"event":event,"sign":sign,"counterparty_gstin":g.counterparty_gstin,"supply_state":g.supply_state,"supply_state_name":g.supply_state_name,"amounts":calc}));
             }
         }
         let totals=totals.into_iter().map(|(k,(b,c,s,i))|(k,serde_json::json!({"taxable_minor":b.to_string(),"cgst_minor":c.to_string(),"sgst_minor":s.to_string(),"igst_minor":i.to_string()}))).collect::<std::collections::BTreeMap<_,_>>();

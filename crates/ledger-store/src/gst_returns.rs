@@ -71,6 +71,8 @@ pub struct ReturnRow {
     pub date: String,
     pub original_invoice: Option<String>,
     pub section: String,
+    pub classification: String,
+    pub classification_basis: Option<String>,
     pub gstin: Option<String>,
     pub supply_state: String,
     pub rate_bps: u32,
@@ -103,6 +105,12 @@ pub struct ReturnFile {
     pub contents: String,
 }
 #[derive(Debug, Serialize)]
+pub struct InwardNoTax {
+    pub category: String,
+    pub inter_state_minor: String,
+    pub intra_state_minor: String,
+}
+#[derive(Debug, Serialize)]
 pub struct GstReturnDraft {
     pub format: &'static str,
     pub version: u32,
@@ -117,7 +125,10 @@ pub struct GstReturnDraft {
     pub gstr1_sections: BTreeMap<String, ReturnAmounts>,
     pub hsn_review: Vec<HsnReview>,
     pub gstr3b_book_3_1_a: ReturnAmounts,
+    pub gstr3b_book_3_1_c: ReturnAmounts,
+    pub gstr3b_book_3_1_e: ReturnAmounts,
     pub gstr3b_book_4_a_5: ReturnAmounts,
+    pub gstr3b_book_5: Vec<InwardNoTax>,
     pub gstr3b_book_3_2_unregistered: BTreeMap<String, ReturnAmounts>,
     pub reconciliation: Vec<GstReconciliation>,
     pub reconciled: bool,
@@ -195,7 +206,11 @@ fn date_export(date: &str) -> Result<String> {
         .format("%d-%b-%y")
         .to_string())
 }
-const HEADERS: [(&str, &str); 5] = [
+const HEADERS: [(&str, &str); 6] = [
+    (
+        "exemp",
+        "Description,Nil Rated Supplies,Exempted(other than nil rated/non GST supply),Non-GST Supplies",
+    ),
     (
         "b2b",
         "GSTIN/UIN of Recipient,Receiver Name,Invoice Number,Invoice date,Invoice Value,Place Of Supply,Reverse Charge,Applicable % of Tax Rate,Invoice Type,E-Commerce GSTIN,Rate,Taxable Value,Cess Amount",
@@ -217,6 +232,59 @@ const HEADERS: [(&str, &str); 5] = [
         "UR Type,Note Number,Note Date,Note Type,Place Of Supply,Note Value,Applicable % of Tax Rate,Rate,Taxable Value,Cess Amount",
     ),
 ];
+type HsnGroups = BTreeMap<(String, String, u32, String), (i128, [i128; 4])>;
+fn accumulate_hsn(
+    store: &LedgerStore,
+    d: &Document,
+    calc: &GstCalculation,
+    registered: bool,
+    hsn: &mut HsnGroups,
+) -> Result<()> {
+    let sign = if d.correction.is_some() { -1 } else { 1 };
+    for (index, l) in calc.lines.iter().enumerate() {
+        let n = [
+            l.taxable_minor
+                .parse()
+                .map_err(|_| invalid("Invalid GST line."))?,
+            l.cgst_minor
+                .parse()
+                .map_err(|_| invalid("Invalid GST line."))?,
+            l.sgst_minor
+                .parse()
+                .map_err(|_| invalid("Invalid GST line."))?,
+            l.igst_minor
+                .parse()
+                .map_err(|_| invalid("Invalid GST line."))?,
+        ];
+        let (qty, unit) = if let Some(c) = &d.correction {
+            let l = &c.lines[index];
+            (crate::parse_quantity(&l.quantity)?, l.item_id)
+        } else {
+            let l = &d.input.lines[index];
+            (crate::parse_quantity(&l.quantity)?, l.item_id)
+        };
+        let unit = if let Some(id) = unit {
+            store
+                .conn
+                .query_row("SELECT unit FROM items WHERE id=?1", [id], |r| {
+                    r.get::<_, String>(0)
+                })?
+        } else {
+            "service quantity (UQC not mapped)".into()
+        };
+        let h = hsn
+            .entry((
+                if registered { "B2B" } else { "B2C" }.into(),
+                l.hsn_sac.clone(),
+                l.rate_bps,
+                unit,
+            ))
+            .or_default();
+        h.0 += i128::from(qty) * sign;
+        add(&mut h.1, n, sign);
+    }
+    Ok(())
+}
 impl LedgerStore {
     pub fn gst_return_draft(&self, query: GstReturnQuery) -> Result<GstReturnDraft> {
         self.require_company()?;
@@ -254,7 +322,10 @@ impl LedgerStore {
             gstr1_sections: BTreeMap::new(),
             hsn_review: vec![],
             gstr3b_book_3_1_a: amounts([0; 4]),
+            gstr3b_book_3_1_c: amounts([0; 4]),
+            gstr3b_book_3_1_e: amounts([0; 4]),
             gstr3b_book_4_a_5: amounts([0; 4]),
+            gstr3b_book_5: vec![],
             gstr3b_book_3_2_unregistered: BTreeMap::new(),
             reconciliation: vec![],
             reconciled: true,
@@ -280,6 +351,9 @@ impl LedgerStore {
         let mut small = BTreeMap::<(String, u32), (String, [i128; 4])>::new();
         let mut hsn = BTreeMap::<(String, String, u32, String), (i128, [i128; 4])>::new();
         let mut interstate = BTreeMap::<String, [i128; 4]>::new();
+        let mut exempt = BTreeMap::<String, [i128; 3]>::new();
+        let mut no_tax_book = [0i128; 3];
+        let mut no_tax_inward = [[0i128; 2]; 2];
         for (d, reversed) in &docs {
             let in_period = d.input.date >= from && d.input.date <= to;
             let reversal_in_period = reversed
@@ -298,7 +372,38 @@ impl LedgerStore {
                 out.issues.push(issue("unclassified_document", d, "No GST classification is recorded. Determine exempt, nil-rated, non-GST or taxable treatment before completing the return."));
                 continue;
             };
-            if outward && g.counterparty_gstin.is_none() && g.supply_state != p.state_code {
+            if !outward && let Some(class) = &g.classification {
+                let index = usize::from(class.kind == "non_gst");
+                let locality = usize::from(class.supplier_state.as_ref() == Some(&p.state_code));
+                let value = values(calc)?[0];
+                if in_period {
+                    no_tax_inward[index][locality] +=
+                        value * if d.correction.is_some() { -1 } else { 1 };
+                }
+                if reversal_in_period {
+                    no_tax_inward[index][locality] -= value;
+                }
+            }
+            if outward && let Some(class) = &g.classification {
+                let index = match class.kind.as_str() {
+                    "nil_rated" => 0,
+                    "exempt" => 1,
+                    "non_gst" => 2,
+                    _ => return Err(invalid("Invalid stored supply classification.")),
+                };
+                let value = values(calc)?[0];
+                if in_period {
+                    no_tax_book[index] += value * if d.correction.is_some() { -1 } else { 1 };
+                }
+                if reversal_in_period {
+                    no_tax_book[index] -= value;
+                }
+            }
+            if outward
+                && g.classification.is_none()
+                && g.counterparty_gstin.is_none()
+                && g.supply_state != p.state_code
+            {
                 let sum = interstate.entry(g.supply_state.clone()).or_default();
                 if in_period {
                     add(
@@ -319,6 +424,47 @@ impl LedgerStore {
                 continue;
             }
             let registered = g.counterparty_gstin.is_some();
+            accumulate_hsn(self, d, calc, registered, &mut hsn)?;
+            if let Some(class) = &g.classification {
+                let sign = if d.correction.is_some() { -1 } else { 1 };
+                let label = format!(
+                    "{}-State supplies to {} persons",
+                    if g.supply_state == p.state_code {
+                        "Intra"
+                    } else {
+                        "Inter"
+                    },
+                    if registered {
+                        "registered"
+                    } else {
+                        "unregistered"
+                    }
+                );
+                let index = match class.kind.as_str() {
+                    "nil_rated" => 0,
+                    "exempt" => 1,
+                    "non_gst" => 2,
+                    _ => return Err(invalid("Invalid stored supply classification.")),
+                };
+                let n = values(calc)?;
+                exempt.entry(label).or_default()[index] += n[0] * sign;
+                add(sections.entry("exemp".into()).or_default(), n, sign);
+                out.gstr1_rows.push(ReturnRow {
+                    document_id: d.id,
+                    number: d.number.clone(),
+                    date: d.input.date.clone(),
+                    original_invoice: d.correction.as_ref().map(|_| original.number.clone()),
+                    section: "exemp".into(),
+                    classification: class.kind.clone(),
+                    classification_basis: Some(class.reason.clone()),
+                    gstin: g.counterparty_gstin.clone(),
+                    supply_state: g.supply_state.clone(),
+                    rate_bps: 0,
+                    sign: sign as i32,
+                    amounts: amounts(n.map(|v| v * sign)),
+                });
+                continue;
+            }
             // Classification follows ORIGINAL gross invoice value/date, never a reduced note value.
             let threshold = if original.input.date.as_str() >= "2024-08-01" {
                 10_000_000i128
@@ -347,7 +493,7 @@ impl LedgerStore {
             let sign = if note { -1 } else { 1 };
             let pos = format!("{}-{}", g.supply_state, g.supply_state_name);
             let mut rates = BTreeMap::<u32, [i128; 4]>::new();
-            for (index, l) in calc.lines.iter().enumerate() {
+            for l in &calc.lines {
                 let n = [
                     l.taxable_minor
                         .parse()
@@ -363,31 +509,6 @@ impl LedgerStore {
                         .map_err(|_| invalid("Invalid GST line."))?,
                 ];
                 add(rates.entry(l.rate_bps).or_default(), n, 1);
-                let (qty, unit) = if let Some(c) = &d.correction {
-                    let l = &c.lines[index];
-                    (crate::parse_quantity(&l.quantity)?, l.item_id)
-                } else {
-                    let l = &d.input.lines[index];
-                    (crate::parse_quantity(&l.quantity)?, l.item_id)
-                };
-                let unit = if let Some(id) = unit {
-                    self.conn
-                        .query_row("SELECT unit FROM items WHERE id=?1", [id], |r| {
-                            r.get::<_, String>(0)
-                        })?
-                } else {
-                    "service quantity (UQC not mapped)".into()
-                };
-                let h = hsn
-                    .entry((
-                        if registered { "B2B" } else { "B2C" }.into(),
-                        l.hsn_sac.clone(),
-                        l.rate_bps,
-                        unit,
-                    ))
-                    .or_default();
-                h.0 += i128::from(qty) * sign;
-                add(&mut h.1, n, sign);
             }
             let name: String = self.conn.query_row(
                 "SELECT name FROM parties WHERE id=?1",
@@ -402,6 +523,8 @@ impl LedgerStore {
                     date: d.input.date.clone(),
                     original_invoice: note.then(|| original.number.clone()),
                     section: section.into(),
+                    classification: "regular".into(),
+                    classification_basis: None,
                     gstin: g.counterparty_gstin.clone(),
                     supply_state: g.supply_state.clone(),
                     rate_bps: rate,
@@ -500,6 +623,30 @@ impl LedgerStore {
                 "".into(),
             ]);
         }
+        for (label, n) in exempt {
+            files.get_mut("exemp").unwrap().push(vec![
+                label,
+                decimal(n[0]),
+                decimal(n[1]),
+                decimal(n[2]),
+            ]);
+        }
+        out.gstr3b_book_5 = no_tax_inward
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| InwardNoTax {
+                category: if i == 0 {
+                    "Nil-rated / exempt (composition excluded)"
+                } else {
+                    "Non-GST"
+                }
+                .into(),
+                inter_state_minor: n[0].to_string(),
+                intra_state_minor: n[1].to_string(),
+            })
+            .collect();
+        out.gstr3b_book_3_1_c = amounts([no_tax_book[0] + no_tax_book[1], 0, 0, 0]);
+        out.gstr3b_book_3_1_e = amounts([no_tax_book[2], 0, 0, 0]);
         out.gstr1_sections = sections.into_iter().map(|(s, n)| (s, amounts(n))).collect();
         out.hsn_review = hsn
             .into_iter()
@@ -532,7 +679,9 @@ impl LedgerStore {
                     .map_err(|_| invalid("Invalid GST register."))?;
             }
             if kind == "sale" {
-                out.gstr3b_book_3_1_a = amounts(expected);
+                let mut regular = expected;
+                regular[0] -= no_tax_book.iter().sum::<i128>();
+                out.gstr3b_book_3_1_a = amounts(regular);
             } else {
                 out.gstr3b_book_4_a_5 = amounts(expected);
             }
@@ -630,6 +779,18 @@ impl LedgerStore {
             &out.gstr3b_book_3_1_a,
         ))
         .chain(std::iter::once((
+            "3.1(c)",
+            "Book nil-rated/exempt outward supplies",
+            "",
+            &out.gstr3b_book_3_1_c,
+        )))
+        .chain(std::iter::once((
+            "3.1(e)",
+            "Book non-GST outward supplies",
+            "",
+            &out.gstr3b_book_3_1_e,
+        )))
+        .chain(std::iter::once((
             "4(A)(5)",
             "Book reviewed input credit; reconcile GSTR-2B/IMS",
             "",
@@ -662,6 +823,27 @@ impl LedgerStore {
                 parse(&n.sgst_minor)?,
                 "0.00".into(),
             ]);
+        }
+        for row in &out.gstr3b_book_5 {
+            for (locality, value) in [
+                ("Inter-State", &row.inter_state_minor),
+                ("Intra-State", &row.intra_state_minor),
+            ] {
+                summary.push(vec![
+                    "5".into(),
+                    row.category.clone(),
+                    locality.into(),
+                    decimal(
+                        value
+                            .parse()
+                            .map_err(|_| invalid("Invalid inward supply value."))?,
+                    ),
+                    "".into(),
+                    "".into(),
+                    "".into(),
+                    "".into(),
+                ]);
+            }
         }
         out.files.push(ReturnFile {
             section: "gstr3b-book-summary".into(),
