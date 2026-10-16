@@ -848,3 +848,37 @@ fn classified_inward_supplies_use_reviewed_supplier_state_without_claiming_input
     restored.restore(&s.export_backup().unwrap()).unwrap();
     assert_eq!(draft(&restored, "2026-10", "monthly"), r);
 }
+
+#[test]
+fn fully_credited_consumer_and_exempt_groups_keep_audit_rows_without_empty_csv_declarations() {
+    let (mut s, _, c, _) = books();
+    for (i, classified) in [false, true].into_iter().enumerate() {
+        let mut input = invoice("sale", c.id, &format!("cancel-{i}"), "29");
+        if classified {
+            let g = input.gst.as_mut().unwrap();
+            g.classification = Some(SupplyClassification {
+                kind: "exempt".into(),
+                reason: "Synthetic reviewed basis".into(),
+                supplier_state: None,
+            });
+            g.rates_bps[0] = 0;
+        }
+        let original = s.post_document(input).unwrap();
+        s.post_document(serde_json::from_value(json!({"kind":"credit_note","date":"2026-10-02","due_date":null,"party_id":c.id,"invoice_id":original.id,"money_account_id":null,"amount":null,"note":"Full cancellation","lines":[],"return_lines":[{"line":0,"quantity":"1"}],"gst_adjustment_reviewed":if classified {None}else{Some(true)},"request_id":format!("full-credit-{i}")})).unwrap()).unwrap();
+    }
+    let r = draft(&s, "2026-10", "monthly");
+    assert_eq!(r["gstr1_rows"].as_array().unwrap().len(), 4);
+    for section in ["b2cs", "exemp"] {
+        assert_eq!(
+            r["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["section"] == section)
+                .unwrap()["row_count"],
+            0
+        );
+    }
+    assert_eq!(r["gstr3b_book_3_1_a"]["taxable_minor"], "0");
+    assert_eq!(r["gstr3b_book_3_1_c"]["taxable_minor"], "0");
+}

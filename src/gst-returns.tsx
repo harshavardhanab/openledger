@@ -261,7 +261,11 @@ export function GstReturns({ state }: { state: Snapshot }) {
                 disabled={f.row_count === 0}
                 onClick={() => void download(f.filename, f.contents, 'text/csv')}
               >
-                Export draft {f.section.toUpperCase()} ({f.row_count})
+                Export draft{' '}
+                {f.section === 'gstr3b-book-summary'
+                  ? 'GSTR-3B book worksheet'
+                  : f.section.toUpperCase()}{' '}
+                ({f.row_count})
               </button>
             ))}
           </div>

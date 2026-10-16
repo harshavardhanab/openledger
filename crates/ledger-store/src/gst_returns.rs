@@ -610,6 +610,9 @@ impl LedgerStore {
             }
         }
         for ((state, rate), (pos, n)) in small {
+            if n.iter().all(|n| *n == 0) {
+                continue;
+            }
             if rate_rounding_differs(n, rate, state == p.state_code) {
                 out.issues.push(ReturnIssue { code:"offline_rounding_difference".into(),document_id:None,reference:format!("B2CS {pos} at {}%",decimal(i128::from(rate))),message:"Tax on aggregated consumer supplies differs from exact book tax. Reconcile offline-tool rounding before filing.".into() });
             }
@@ -624,6 +627,9 @@ impl LedgerStore {
             ]);
         }
         for (label, n) in exempt {
+            if n.iter().all(|n| *n == 0) {
+                continue;
+            }
             files.get_mut("exemp").unwrap().push(vec![
                 label,
                 decimal(n[0]),
