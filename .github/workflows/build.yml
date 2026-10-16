@@ -1,15 +1,28 @@
 name: Build and test
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      package_run_id:
+        description: Optional successful package run ID to test installed packages without rebuilding
+        required: false
+        type: string
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: checks-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  installed:
+    if: inputs.package_run_id != ''
+    uses: ./.github/workflows/native-packages.yml
+    with:
+      package_run_id: ${{ inputs.package_run_id }}
   build:
+    if: inputs.package_run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -30,5 +43,41 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --exclude open-ledger-desktop --locked
-      - run: npm run build
-      - run: cargo build -p open-ledger-desktop --release --locked
+      - name: Install browser test engines
+        run: npx playwright install --with-deps chromium webkit
+      - run: npm run test:e2e
+      - name: Build native executable with bundled frontend
+        run: npm run desktop:build -- --no-bundle -- --locked
+      - name: Install native WebDriver
+        if: runner.os != 'macOS'
+        run: cargo install tauri-driver --locked
+      - name: Linux native WebDriver dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y webkit2gtk-driver xvfb
+      - name: Windows native WebDriver
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+          $version = (Get-Item $edge).VersionInfo.ProductVersion
+          Invoke-WebRequest "https://msedgedriver.microsoft.com/$version/edgedriver_win64.zip" -OutFile "$env:RUNNER_TEMP/driver.zip"
+          Expand-Archive "$env:RUNNER_TEMP/driver.zip" -DestinationPath "$env:RUNNER_TEMP/edgedriver"
+          "$env:RUNNER_TEMP/edgedriver" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Native desktop smoke tests (Linux)
+        if: runner.os == 'Linux'
+        # Xvfb has no GPU. See https://v2.tauri.app/develop/debug/linux-graphics/
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          WEBKIT_DISABLE_DMABUF_RENDERER: '1'
+          WEBKIT_DISABLE_COMPOSITING_MODE: '1'
+        run: xvfb-run -a npm run test:desktop
+      - name: Native desktop smoke tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/native-windows.ps1
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-failures-${{ runner.os }}
+          path: test-results/
+          if-no-files-found: ignore

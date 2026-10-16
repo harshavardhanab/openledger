@@ -1,0 +1,1480 @@
+use ledger_store::*;
+use serde_json::{Value, json};
+fn books() -> (LedgerStore, GstProfile, Party, Party) {
+    let mut s = LedgerStore::memory().unwrap();
+    s.create_company(CompanyInput {
+        name: "GST worked examples".into(),
+        currency: "INR".into(),
+        fiscal_year_start: "2026-04-01".into(),
+    })
+    .unwrap();
+    let a = s.gst_control_accounts().unwrap();
+    let p = GstProfile {
+        gstin: "29ABCDE1234F1Z5".into(),
+        state_code: "29".into(),
+        state_name: "Karnataka".into(),
+        address: "Synthetic registered office, Bengaluru".into(),
+        output: serde_json::from_value(a["output"].clone()).unwrap(),
+        input: serde_json::from_value(a["input"].clone()).unwrap(),
+    };
+    s.configure_gst(p.clone()).unwrap();
+    let customer = s
+        .create_party(PartyInput {
+            name: "Synthetic buyer".into(),
+            kind: "customer".into(),
+            contact: "".into(),
+            account_id: 3,
+        })
+        .unwrap();
+    let supplier = s
+        .create_party(PartyInput {
+            name: "Synthetic supplier".into(),
+            kind: "supplier".into(),
+            contact: "".into(),
+            account_id: 5,
+        })
+        .unwrap();
+    (s, p, customer, supplier)
+}
+fn invoice(kind: &str, party: i64, key: &str, state: &str) -> DocumentInput {
+    DocumentInput {
+        gst_adjustment_reviewed: None,
+        return_lines: None,
+        reviewed_postings: None,
+        gst: Some(GstInput {
+            itc_allocation: None,
+            classification: None,
+            supply_state: state.into(),
+            supply_state_name: if state == "29" {
+                "Karnataka"
+            } else {
+                "Maharashtra"
+            }
+            .into(),
+            counterparty_gstin: if kind == "purchase" {
+                Some("29ABCDE1234F1Z5".into())
+            } else {
+                None
+            },
+            counterparty_address: "Synthetic buyer or supplier address".into(),
+            delivery_address: "Synthetic delivery address".into(),
+            supplier_reference: if kind == "purchase" {
+                Some("SUP-001".into())
+            } else {
+                None
+            },
+            credit_reviewed: kind == "purchase",
+            rates_bps: vec![1800],
+            hsn_sac: vec!["998314".into()],
+        }),
+        kind: kind.into(),
+        date: "2026-10-01".into(),
+        due_date: Some("2026-10-14".into()),
+        party_id: Some(party),
+        invoice_id: None,
+        money_account_id: None,
+        amount: None,
+        note: "Synthetic 18% rate example, not a product-rate recommendation".into(),
+        lines: vec![DocumentLine {
+            description: "Synthetic service".into(),
+            quantity: "1".into(),
+            unit_price: "1000".into(),
+            account_id: if kind == "sale" { 7 } else { 8 },
+            item_id: None,
+        }],
+        request_id: key.into(),
+    }
+}
+#[test]
+fn intrastate_sales_tax_is_a_liability_and_settlements_use_the_gross_amount() {
+    let (mut s, p, c, _) = books();
+    let input = invoice("sale", c.id, "gst-sale", "29");
+    let d = s.post_document(input.clone()).unwrap();
+    assert_eq!(d.total_minor, "118000");
+    let g = d.gst.as_ref().unwrap();
+    assert_eq!(g.cgst_minor, "9000");
+    assert_eq!(g.sgst_minor, "9000");
+    assert_eq!(g.igst_minor, "0");
+    assert_eq!(
+        s.ledger(p.output.cgst, None, None).unwrap().closing_minor,
+        "-9000"
+    );
+    assert_eq!(
+        s.financial_statements(None, None).unwrap().income_minor,
+        "100000"
+    );
+    assert!(s.financial_statements(None, None).unwrap().balanced);
+    let payment = DocumentInput {
+        gst_adjustment_reviewed: None,
+        return_lines: None,
+        reviewed_postings: None,
+        gst: None,
+        kind: "receipt".into(),
+        date: "2026-10-02".into(),
+        due_date: None,
+        party_id: Some(c.id),
+        invoice_id: Some(d.id),
+        money_account_id: Some(2),
+        amount: Some("400".into()),
+        note: "Partial receipt".into(),
+        lines: vec![],
+        request_id: "gst-receipt".into(),
+    };
+    let mut wrong_bank = payment.clone();
+    wrong_bank.money_account_id = Some(p.input.cgst);
+    wrong_bank.request_id = "bad-gst-bank".into();
+    assert!(s.post_document(wrong_bank).is_err());
+    s.post_document(payment).unwrap();
+    assert_eq!(
+        s.business_state(0, 50, None)
+            .unwrap()
+            .documents
+            .iter()
+            .find(|r| r.document.id == d.id)
+            .unwrap()
+            .outstanding_minor,
+        "78000"
+    );
+    let mut t = LedgerStore::memory().unwrap();
+    t.restore(&s.export_backup().unwrap()).unwrap();
+    assert_eq!(t.post_document(input).unwrap().id, d.id);
+    assert_eq!(t.gst_profile().unwrap(), Some(p));
+}
+#[test]
+fn interstate_sales_and_reviewed_purchase_credits_have_independent_postings() {
+    let (mut s, p, c, v) = books();
+    let sale = s
+        .post_document(invoice("sale", c.id, "interstate", "27"))
+        .unwrap();
+    assert_eq!(sale.gst.unwrap().igst_minor, "18000");
+    assert_eq!(
+        s.ledger(p.output.igst, None, None).unwrap().closing_minor,
+        "-18000"
+    );
+    let purchase = s
+        .post_document(invoice("purchase", v.id, "local-input", "29"))
+        .unwrap();
+    assert_eq!(purchase.total_minor, "118000");
+    assert_eq!(
+        s.ledger(p.input.cgst, None, None).unwrap().closing_minor,
+        "9000"
+    );
+    assert_eq!(s.ledger(5, None, None).unwrap().closing_minor, "-118000");
+    assert_eq!(
+        s.financial_statements(None, None).unwrap().profit_minor,
+        "0"
+    );
+    let report = s.gst_report("2026-10-01", "2026-10-14").unwrap();
+    assert_eq!(report["totals"]["sale"]["igst_minor"], "18000");
+    assert_eq!(report["totals"]["purchase"]["cgst_minor"], "9000");
+    assert_eq!(report["filing_ready"], false);
+    let mut t = LedgerStore::memory().unwrap();
+    t.restore(&s.export_backup().unwrap()).unwrap();
+    assert_eq!(
+        t.gst_report("2026-10-01", "2026-10-14").unwrap()["totals"],
+        report["totals"]
+    );
+}
+#[test]
+fn unsupported_or_unreviewed_gst_requests_fail_atomically() {
+    let (mut s, p, c, v) = books();
+    let base = invoice("purchase", v.id, "input", "29");
+    for mutation in 0..6 {
+        let mut d = base.clone();
+        let g = d.gst.as_mut().unwrap();
+        match mutation {
+            0 => g.credit_reviewed = false,
+            1 => g.supply_state = "27".into(),
+            2 => g.counterparty_gstin = Some("☃☃☃☃☃".into()),
+            3 => g.hsn_sac[0] = "bogus".into(),
+            4 => g.rates_bps[0] = 0,
+            _ => g.supplier_reference = None,
+        };
+        assert!(s.post_document(d).is_err());
+    }
+    assert_eq!(s.snapshot().unwrap().journal_count, 0);
+    assert!(
+        s.create_party(PartyInput {
+            name: "Bad control mapping".into(),
+            kind: "customer".into(),
+            contact: "".into(),
+            account_id: p.input.cgst
+        })
+        .is_err()
+    );
+    let mut sale = invoice("sale", c.id, "sale", "29");
+    sale.lines[0].account_id = p.input.cgst;
+    assert!(s.post_document(sale).is_err());
+    assert!(s.configure_gst(p).is_err());
+}
+#[test]
+fn gst_register_uses_reversal_dates_and_tampered_tax_backups_are_rejected() {
+    let (mut s, _, c, _) = books();
+    let d = s
+        .post_document(invoice("sale", c.id, "sale", "29"))
+        .unwrap();
+    s.reverse(
+        d.journal_id,
+        "2026-10-05",
+        "Accounting correction, review statutory note separately",
+        "gst-reverse",
+    )
+    .unwrap();
+    assert_eq!(
+        s.gst_report("2026-10-01", "2026-10-04").unwrap()["totals"]["sale"]["cgst_minor"],
+        "9000"
+    );
+    assert_eq!(
+        s.gst_report("2026-10-05", "2026-10-05").unwrap()["totals"]["sale"]["cgst_minor"],
+        "-9000"
+    );
+    assert_eq!(
+        s.gst_report("2026-10-01", "2026-10-14").unwrap()["totals"]["sale"]["cgst_minor"],
+        "0"
+    );
+    let mut bad: Value = serde_json::from_str(&s.export_backup().unwrap()).unwrap();
+    bad["business"]["documents"][0]["gst"]["cgst_minor"] = json!("8999");
+    assert!(s.restore(&bad.to_string()).is_err());
+    assert_eq!(s.snapshot().unwrap().journal_count, 2);
+    let mut t = LedgerStore::memory().unwrap();
+    t.restore(&s.export_backup().unwrap()).unwrap();
+}
+#[test]
+fn schema_and_backup_v2_compatibility_survive_the_gst_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v2.sqlite");
+    let c = rusqlite::Connection::open(&path).unwrap();
+    c.execute_batch(include_str!("../src/schema.sql")).unwrap();
+    c.execute_batch(include_str!("../src/migration_v2.sql"))
+        .unwrap();
+    drop(c);
+    let mut s = LedgerStore::open(&path).unwrap();
+    s.create_company(CompanyInput {
+        name: "Old books".into(),
+        currency: "INR".into(),
+        fiscal_year_start: "2026-04-01".into(),
+    })
+    .unwrap();
+    let p = s
+        .create_party(PartyInput {
+            name: "Old buyer".into(),
+            kind: "customer".into(),
+            contact: "".into(),
+            account_id: 3,
+        })
+        .unwrap();
+    let mut d = invoice("sale", p.id, "old", "29");
+    d.gst = None;
+    s.post_document(d.clone()).unwrap();
+    let mut backup: Value = serde_json::from_str(&s.export_backup().unwrap()).unwrap();
+    backup["version"] = json!(2);
+    backup["business"]["numbering"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|n| {
+            ["sale", "purchase", "receipt", "payment", "stock", "close"]
+                .contains(&n["kind"].as_str().unwrap())
+        });
+    let mut t = LedgerStore::memory().unwrap();
+    t.restore(&backup.to_string()).unwrap();
+    assert_eq!(t.post_document(d).unwrap().id, 1);
+    assert!(t.gst_profile().unwrap().is_none());
+}
+#[test]
+fn company_inventory_does_not_migrate_inactive_books() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir
+        .path()
+        .join("books-00000000-0000-4000-8000-000000000001.sqlite");
+    let conn = rusqlite::Connection::open(&old).unwrap();
+    conn.execute_batch(include_str!("../src/schema.sql"))
+        .unwrap();
+    drop(conn);
+    let service = LedgerService::open(&dir.path().join("active.sqlite")).unwrap();
+    service.request("books", json!({})).unwrap();
+    let conn = rusqlite::Connection::open(&old).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+#[test]
+fn linked_gst_returns_sum_to_original_components_and_register_uses_note_dates() {
+    let (mut s, _, c, _) = books();
+    let mut input = invoice("sale", c.id, "tiny-sale", "29");
+    input.lines[0].quantity = "3".into();
+    input.lines[0].unit_price = "0.03".into();
+    let sale = s.post_document(input).unwrap();
+    assert_eq!(sale.total_minor, "11"); // 9 taxable + 1 CGST + 1 SGST.
+    let unreviewed = serde_json::json!({"kind":"credit_note","date":"2026-10-03","due_date":null,"party_id":c.id,"invoice_id":sale.id,"money_account_id":null,"amount":null,"note":"Requires review","lines":[],"return_lines":[{"line":0,"quantity":"1"}],"request_id":"unreviewed"});
+    assert!(
+        s.post_document(serde_json::from_value(unreviewed).unwrap())
+            .is_err()
+    );
+    let mut totals = [0i64; 4];
+    for i in 0..3 {
+        let d = s
+            .post_document(DocumentInput {
+                gst_adjustment_reviewed: Some(true),
+                return_lines: Some(vec![ReturnLine {
+                    line: 0,
+                    quantity: "1".into(),
+                }]),
+                reviewed_postings: None,
+                gst: None,
+                kind: "credit_note".into(),
+                date: format!("2026-10-0{}", i + 3),
+                due_date: None,
+                party_id: Some(c.id),
+                invoice_id: Some(sale.id),
+                money_account_id: None,
+                amount: None,
+                note: "Cancellation of one unit".into(),
+                lines: vec![],
+                request_id: format!("note-{i}"),
+            })
+            .unwrap();
+        let g = d.gst.unwrap();
+        for (j, n) in [
+            &g.taxable_minor,
+            &g.cgst_minor,
+            &g.sgst_minor,
+            &g.igst_minor,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            totals[j] += n.parse::<i64>().unwrap();
+        }
+    }
+    assert_eq!(totals, [9, 1, 1, 0]);
+    assert_eq!(
+        s.gst_report("2026-10-01", "2026-10-05").unwrap()["totals"]["sale"]["taxable_minor"],
+        "0"
+    );
+    let report = s.gst_report("2026-10-03", "2026-10-05").unwrap();
+    assert_eq!(report["totals"]["sale"]["cgst_minor"], "-1");
+    assert_eq!(report["rows"][0]["event"], "return_note");
+    assert_eq!(report["rows"][0]["original_invoice"], sale.number);
+    assert_eq!(report["filing_ready"], false);
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&s.export_backup().unwrap()).unwrap();
+    assert_eq!(restored.ledger(3, None, None).unwrap().closing_minor, "0");
+}
+
+fn draft(s: &LedgerStore, period: &str, frequency: &str) -> Value {
+    serde_json::to_value(
+        s.gst_return_draft(GstReturnQuery {
+            period: period.into(),
+            frequency: frequency.into(),
+        })
+        .unwrap(),
+    )
+    .unwrap()
+}
+#[test]
+fn return_drafts_classify_gross_thresholds_and_preserve_exact_csv_and_control_totals() {
+    let (mut s, _, c, _) = books();
+    let mut registered = invoice("sale", c.id, "b2b", "29");
+    registered.gst.as_mut().unwrap().counterparty_gstin = Some("29ABCDE1234F1Z5".into());
+    s.post_document(registered).unwrap();
+    // Exact gross threshold is B2CS; one paise above it is B2CL.
+    let mut at = invoice("sale", c.id, "at-limit", "27");
+    at.lines[0].unit_price = "84745.76".into(); // +18% = 100000.00.
+    assert_eq!(s.post_document(at).unwrap().total_minor, "10000000");
+    let mut over = invoice("sale", c.id, "over-limit", "27");
+    over.lines[0].unit_price = "84745.77".into();
+    assert_eq!(s.post_document(over).unwrap().total_minor, "10000001");
+    let r = draft(&s, "2026-10", "monthly");
+    assert_eq!(r["gstr1_rows"][0]["section"], "b2b");
+    assert_eq!(r["gstr1_rows"][1]["section"], "b2cs");
+    assert_eq!(r["gstr1_rows"][2]["section"], "b2cl");
+    assert_eq!(
+        r["gstr3b_book_3_2_unregistered"]["27"]["taxable_minor"],
+        "16949153"
+    );
+    assert_eq!(r["reconciled"], true);
+    assert!(r["issues"].as_array().unwrap().is_empty());
+    assert_eq!(r["filing_ready"], false);
+    let csv = r["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["section"] == "b2cl")
+        .unwrap()["contents"]
+        .as_str()
+        .unwrap();
+    assert!(csv.starts_with("\"Invoice Number\",\"Invoice date\",\"Invoice Value\""));
+    assert!(csv.contains("\"100000.01\""));
+    assert!(csv.contains("\"01-Oct-26\""));
+    assert!(!csv.contains("e+"));
+    assert_eq!(s.snapshot().unwrap().journal_count, 3); // Preparation is read-only.
+}
+#[test]
+fn return_drafts_route_credits_using_original_invoice_and_keep_small_consumer_notes_net() {
+    let (mut s, _, c, _) = books();
+    for (i, price) in ["1000", "100000"].iter().enumerate() {
+        let mut d = invoice("sale", c.id, &format!("consumer-{i}"), "27");
+        d.date = "2026-09-01".into();
+        d.lines[0].quantity = "10".into();
+        d.lines[0].unit_price = (*price).into();
+        let original = s.post_document(d).unwrap();
+        let note: DocumentInput = serde_json::from_value(json!({
+            "kind":"credit_note","date":"2026-10-01","due_date":null,"party_id":c.id,
+            "invoice_id":original.id,"money_account_id":null,"amount":null,"note":"Partial credit",
+            "lines":[],"return_lines":[{"line":0,"quantity":"0.1"}],"gst_adjustment_reviewed":true,
+            "request_id":format!("note-{i}")
+        }))
+        .unwrap();
+        s.post_document(note).unwrap();
+    }
+    let r = draft(&s, "2026-10", "monthly");
+    assert_eq!(r["gstr1_rows"][0]["section"], "b2cs");
+    assert_eq!(r["gstr1_rows"][0]["amounts"]["taxable_minor"], "-10000");
+    assert_eq!(r["gstr1_rows"][1]["section"], "cdnur");
+    assert_eq!(r["gstr1_rows"][1]["original_invoice"], "INV-000002");
+    assert_eq!(r["gstr3b_book_3_1_a"]["igst_minor"], "-181800");
+    assert_eq!(r["reconciled"], true);
+    let b2cs = r["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["section"] == "b2cs")
+        .unwrap();
+    assert!(b2cs["contents"].as_str().unwrap().contains("\"-100.00\""));
+    let cdnur = r["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["section"] == "cdnur")
+        .unwrap();
+    assert!(
+        cdnur["contents"]
+            .as_str()
+            .unwrap()
+            .contains("\"B2CL\",\"CN-000002\",\"01-Oct-26\",\"C\"")
+    );
+    assert_eq!(r["hsn_review"][0]["quantity_milli"], "-200");
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&s.export_backup().unwrap()).unwrap();
+    assert_eq!(draft(&restored, "2026-10", "monthly"), r);
+}
+#[test]
+fn draft_review_identifies_unclassified_documents_reversals_and_offsetting_manual_tax_entries() {
+    let (mut s, p, c, _) = books();
+    let d = s
+        .post_document(invoice("sale", c.id, "reversed", "29"))
+        .unwrap();
+    s.reverse(
+        d.journal_id,
+        "2026-10-03",
+        "Accounting correction",
+        "reverse",
+    )
+    .unwrap();
+    let mut plain = invoice("sale", c.id, "no-tax", "29");
+    plain.gst = None;
+    s.post_document(plain).unwrap();
+    let j = s
+        .post(ledger_core::JournalInput {
+            date: "2026-10-03".into(),
+            reference: "manual-tax".into(),
+            description: "Tax adjustment requires classification".into(),
+            request_id: "manual-tax".into(),
+            lines: vec![
+                ledger_core::PostingInput {
+                    account_id: p.output.cgst,
+                    side: ledger_core::Side::Debit,
+                    amount: "1.00".into(),
+                },
+                ledger_core::PostingInput {
+                    account_id: 8,
+                    side: ledger_core::Side::Credit,
+                    amount: "1.00".into(),
+                },
+            ],
+        })
+        .unwrap();
+    let mismatch = draft(&s, "2026-10", "monthly");
+    assert_eq!(mismatch["reconciled"], false);
+    assert_eq!(mismatch["reconciliation"][0]["difference_minor"], "-100");
+    s.reverse(j, "2026-10-04", "Undo manual adjustment", "undo-manual")
+        .unwrap();
+    let r = draft(&s, "2026-10", "monthly");
+    assert_eq!(r["reconciled"], true);
+    assert!(r["gstr1_rows"].as_array().unwrap().is_empty());
+    let codes = r["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["code"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(codes.contains(&"accounting_reversal"));
+    assert!(codes.contains(&"unclassified_document"));
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|c| c.starts_with("manual_gst_journal_"))
+            .count(),
+        2
+    );
+}
+#[test]
+fn draft_period_validation_quarters_leap_year_and_historical_b2cl_thresholds() {
+    let (mut s, _, c, _) = books();
+    for (date, key) in [("2024-07-15", "july"), ("2024-08-15", "august")] {
+        let mut d = invoice("sale", c.id, key, "27");
+        d.date = date.into();
+        d.due_date = Some(date.into());
+        d.lines[0].unit_price = "100000".into();
+        s.post_document(d).unwrap();
+    }
+    assert_eq!(
+        draft(&s, "2024-07", "monthly")["gstr1_rows"][0]["section"],
+        "b2cs"
+    );
+    assert_eq!(
+        draft(&s, "2024-08", "monthly")["gstr1_rows"][0]["section"],
+        "b2cl"
+    );
+    let q = draft(&s, "2024-09", "quarterly");
+    assert_eq!(q["from"], "2024-07-01");
+    assert_eq!(q["to"], "2024-09-30");
+    assert_eq!(draft(&s, "2024-02", "monthly")["to"], "2024-02-29");
+    for (period, frequency) in [
+        ("2026-10", "quarterly"),
+        ("2017-06", "monthly"),
+        ("2026-2", "monthly"),
+        ("2026-13", "monthly"),
+        ("💸-01", "monthly"),
+        ("2026-10", "daily"),
+    ] {
+        assert!(
+            s.gst_return_draft(GstReturnQuery {
+                period: period.into(),
+                frequency: frequency.into()
+            })
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn draft_csv_keeps_large_decimals_mixed_rates_and_registered_credit_signs() {
+    let (mut s, _, c, _) = books();
+    let mut input = invoice("sale", c.id, "large-exact", "29");
+    input.lines[0].unit_price = "90071992547409.93".into();
+    input.gst.as_mut().unwrap().counterparty_gstin = Some("29ABCDE1234F1Z5".into());
+    input.lines.push(DocumentLine {
+        description: "Second rate".into(),
+        quantity: "1".into(),
+        unit_price: "1".into(),
+        account_id: 7,
+        item_id: None,
+    });
+    input.gst.as_mut().unwrap().rates_bps.push(500);
+    input.gst.as_mut().unwrap().hsn_sac.push("998314".into());
+    let original = s.post_document(input).unwrap();
+    let d: DocumentInput = serde_json::from_value(json!({
+        "kind":"credit_note","date":"2026-10-02","due_date":null,"party_id":c.id,
+        "invoice_id":original.id,"money_account_id":null,"amount":null,"note":"Full return",
+        "lines":[],"return_lines":[{"line":0,"quantity":"1"},{"line":1,"quantity":"1"}],"gst_adjustment_reviewed":true,
+        "request_id":"large-credit"
+    })).unwrap();
+    s.post_document(d).unwrap();
+    let r = draft(&s, "2026-10", "monthly");
+    assert_eq!(
+        r["gstr1_sections"]["b2b"]["taxable_minor"],
+        "9007199254741093"
+    );
+    assert_eq!(
+        r["gstr1_sections"]["cdnr"]["taxable_minor"],
+        "-9007199254741093"
+    );
+    assert_eq!(r["gstr3b_book_3_1_a"]["taxable_minor"], "0");
+    let files = r["files"].as_array().unwrap();
+    let b2b = files.iter().find(|f| f["section"] == "b2b").unwrap();
+    let cdnr = files.iter().find(|f| f["section"] == "cdnr").unwrap();
+    assert_eq!(b2b["row_count"], 2);
+    assert_eq!(cdnr["row_count"], 2);
+    assert!(
+        b2b["contents"]
+            .as_str()
+            .unwrap()
+            .contains("\"90071992547409.93\"")
+    );
+    assert!(cdnr["contents"].as_str().unwrap().contains("\"C\""));
+    assert!(
+        cdnr["contents"]
+            .as_str()
+            .unwrap()
+            .contains("\"90071992547409.93\"")
+    ); // Positive value; C supplies the note direction.
+}
+#[test]
+fn draft_flags_group_rounding_and_manual_income_instead_of_silently_omitting_them() {
+    let (mut s, _, c, _) = books();
+    let mut input = invoice("sale", c.id, "rounding", "29");
+    input.lines[0].unit_price = "0.03".into();
+    input.lines.push(input.lines[0].clone());
+    input.gst.as_mut().unwrap().rates_bps.push(1800);
+    input.gst.as_mut().unwrap().hsn_sac.push("998314".into());
+    s.post_document(input).unwrap(); // Each 3-paise line has zero half-component tax; six paise aggregated has a one-paise half component.
+    s.post(ledger_core::JournalInput {
+        date: "2026-10-01".into(),
+        reference: "manual-sale".into(),
+        description: "Unclassified sale".into(),
+        request_id: "manual-sale".into(),
+        lines: vec![
+            ledger_core::PostingInput {
+                account_id: 2,
+                side: ledger_core::Side::Debit,
+                amount: "100".into(),
+            },
+            ledger_core::PostingInput {
+                account_id: 7,
+                side: ledger_core::Side::Credit,
+                amount: "100".into(),
+            },
+        ],
+    })
+    .unwrap();
+    let r = draft(&s, "2026-10", "monthly");
+    let issues = r["issues"].as_array().unwrap();
+    assert!(
+        issues
+            .iter()
+            .any(|i| i["code"] == "offline_rounding_difference")
+    );
+    assert!(issues.iter().any(|i| i["reference"] == "manual-sale"));
+    assert_eq!(r["reconciled"], true); // Matching ledger alone cannot certify a return.
+}
+
+#[test]
+fn classified_zero_tax_supplies_post_without_tax_and_flow_to_separate_draft_sections() {
+    let (mut s, p, c, _) = books();
+    let mut docs = vec![];
+    for (i, kind) in ["nil_rated", "exempt", "non_gst"].into_iter().enumerate() {
+        let mut d = invoice("sale", c.id, kind, if i == 1 { "27" } else { "29" });
+        let g = d.gst.as_mut().unwrap();
+        g.classification = Some(SupplyClassification {
+            supplier_state: None,
+            kind: kind.into(),
+            reason: "Synthetic independently reviewed classification basis".into(),
+        });
+        g.rates_bps = vec![0];
+        if i == 1 {
+            g.counterparty_gstin = Some("27ABCDE1234F1Z5".into());
+        }
+        let posted = s.post_document(d.clone()).unwrap();
+        assert_eq!(posted.total_minor, "100000");
+        assert_eq!(posted.gst.as_ref().unwrap().cgst_minor, "0");
+        assert_eq!(s.post_document(d).unwrap().id, posted.id);
+        docs.push(posted);
+    }
+    assert_eq!(
+        s.ledger(p.output.cgst, None, None).unwrap().closing_minor,
+        "0"
+    );
+    let note: DocumentInput = serde_json::from_value(json!({"kind":"credit_note","date":"2026-10-02","due_date":null,"party_id":c.id,"invoice_id":docs[0].id,"money_account_id":null,"amount":null,"note":"Return half of nil-rated supply","lines":[],"return_lines":[{"line":0,"quantity":"0.5"}],"request_id":"nil-return"})).unwrap();
+    s.post_document(note).unwrap();
+    let r = draft(&s, "2026-10", "monthly");
+    assert_eq!(r["gstr3b_book_3_1_a"]["taxable_minor"], "0");
+    assert_eq!(r["gstr3b_book_3_1_c"]["taxable_minor"], "150000");
+    assert_eq!(r["gstr3b_book_3_1_e"]["taxable_minor"], "100000");
+    assert!(
+        r["gstr3b_book_3_2_unregistered"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(r["gstr1_sections"]["exemp"]["taxable_minor"], "250000");
+    assert_eq!(r["reconciled"], true);
+    let file = r["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["section"] == "exemp")
+        .unwrap();
+    let csv = file["contents"].as_str().unwrap();
+    assert!(csv.contains(
+        "\"Intra-State supplies to unregistered persons\",\"500.00\",\"0.00\",\"1000.00\""
+    ));
+    assert!(
+        csv.contains(
+            "\"Inter-State supplies to registered persons\",\"0.00\",\"1000.00\",\"0.00\""
+        )
+    );
+    assert!(r["issues"].as_array().unwrap().is_empty());
+    let backup = s.export_backup().unwrap();
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&backup).unwrap();
+    assert_eq!(draft(&restored, "2026-10", "monthly"), r);
+    let mut old: Value = serde_json::from_str(&backup).unwrap();
+    old["version"] = json!(5);
+    restored.restore(&old.to_string()).unwrap();
+    old["version"] = json!(4);
+    assert!(restored.restore(&old.to_string()).is_err());
+    let mut bad: Value = serde_json::from_str(&backup).unwrap();
+    bad["business"]["documents"][0]["input"]["gst"]["classification"]["kind"] = json!("regular");
+    assert!(restored.restore(&bad.to_string()).is_err());
+}
+#[test]
+fn zero_tax_classifications_reject_tax_rates_missing_review_and_purchase_misuse_atomically() {
+    let (mut s, _, c, supplier) = books();
+    let mut base = invoice("sale", c.id, "nil", "29");
+    base.gst.as_mut().unwrap().classification = Some(SupplyClassification {
+        supplier_state: None,
+        kind: "nil_rated".into(),
+        reason: "Reviewed reference".into(),
+    });
+    base.gst.as_mut().unwrap().rates_bps = vec![0];
+    for mutation in 0..5 {
+        let mut input = base.clone();
+        match mutation {
+            0 => input.gst.as_mut().unwrap().rates_bps[0] = 1800,
+            1 => input
+                .gst
+                .as_mut()
+                .unwrap()
+                .classification
+                .as_mut()
+                .unwrap()
+                .reason
+                .clear(),
+            2 => {
+                input
+                    .gst
+                    .as_mut()
+                    .unwrap()
+                    .classification
+                    .as_mut()
+                    .unwrap()
+                    .kind = "zero_rated_export".into()
+            }
+            3 => {
+                input.kind = "purchase".into();
+                input.party_id = Some(supplier.id);
+                input.lines[0].account_id = 8;
+            }
+            _ => input.gst.as_mut().unwrap().classification = None,
+        }
+        assert!(s.post_document(input).is_err());
+    }
+    assert_eq!(s.snapshot().unwrap().journal_count, 0);
+}
+#[test]
+fn v4_backup_and_database_migration_preserve_regular_gst_retry_identity() {
+    let (mut s, _, c, _) = books();
+    let input = invoice("sale", c.id, "legacy-regular", "29");
+    let posted = s.post_document(input.clone()).unwrap();
+    let mut old: Value = serde_json::from_str(&s.export_backup().unwrap()).unwrap();
+    old["version"] = json!(4);
+    assert!(
+        old["business"]["documents"][0]["input"]["gst"]
+            .get("classification")
+            .is_none()
+    );
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&old.to_string()).unwrap();
+    assert_eq!(restored.post_document(input).unwrap().id, posted.id);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-v4.sqlite");
+    let mut disk = LedgerStore::open(&path).unwrap();
+    disk.restore(&old.to_string()).unwrap();
+    drop(disk);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE itc_adjustments").unwrap();
+    conn.pragma_update(None, "user_version", 4).unwrap();
+    drop(conn);
+    let migrated = LedgerStore::open(&path).unwrap();
+    assert_eq!(migrated.snapshot().unwrap().journal_count, 1);
+    assert_eq!(
+        migrated.gst_profile().unwrap().unwrap().gstin,
+        "29ABCDE1234F1Z5"
+    );
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
+}
+
+#[test]
+fn classified_inward_supplies_use_reviewed_supplier_state_without_claiming_input_tax() {
+    let (mut s, _, _, supplier) = books();
+    for (i, (kind, state)) in [("nil_rated", "27"), ("exempt", "29"), ("non_gst", "27")]
+        .into_iter()
+        .enumerate()
+    {
+        let mut input = invoice("purchase", supplier.id, &format!("inward-{i}"), "29");
+        let g = input.gst.as_mut().unwrap();
+        g.classification = Some(SupplyClassification {
+            kind: kind.into(),
+            reason: "Reviewed domestic non-taxable inward supply".into(),
+            supplier_state: Some(state.into()),
+        });
+        g.credit_reviewed = false;
+        g.rates_bps[0] = 0;
+        g.counterparty_gstin = None;
+        let posted = s.post_document(input.clone()).unwrap();
+        assert_eq!(posted.total_minor, "100000");
+        if i == 0 {
+            let note: DocumentInput = serde_json::from_value(json!({"kind":"debit_note","date":"2026-10-02","due_date":null,"party_id":supplier.id,"invoice_id":posted.id,"money_account_id":null,"amount":null,"note":"Partial inward return","lines":[],"return_lines":[{"line":0,"quantity":"0.25"}],"request_id":"nil-purchase-return"})).unwrap();
+            s.post_document(note).unwrap();
+        }
+        let mut wrong = input.clone();
+        wrong.request_id = format!("bad-state-{i}");
+        wrong.gst.as_mut().unwrap().counterparty_gstin = Some(
+            if state == "27" {
+                "29ABCDE1234F1Z5"
+            } else {
+                "27ABCDE1234F1Z5"
+            }
+            .into(),
+        );
+        assert!(s.post_document(wrong).is_err());
+        let mut wrong = input;
+        wrong.request_id = format!("bad-credit-{i}");
+        wrong.gst.as_mut().unwrap().credit_reviewed = true;
+        assert!(s.post_document(wrong).is_err());
+    }
+    let r = draft(&s, "2026-10", "monthly");
+    assert!(r["gstr1_rows"].as_array().unwrap().is_empty());
+    assert_eq!(r["gstr3b_book_5"][0]["inter_state_minor"], "75000");
+    assert_eq!(r["gstr3b_book_5"][0]["intra_state_minor"], "100000");
+    assert_eq!(r["gstr3b_book_5"][1]["inter_state_minor"], "100000");
+    assert_eq!(r["gstr3b_draft_4_a_5"]["igst_minor"], "0");
+    assert_eq!(r["reconciled"], true);
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&s.export_backup().unwrap()).unwrap();
+    assert_eq!(draft(&restored, "2026-10", "monthly"), r);
+}
+
+#[test]
+fn fully_credited_consumer_and_exempt_groups_keep_audit_rows_without_empty_csv_declarations() {
+    let (mut s, _, c, _) = books();
+    for (i, classified) in [false, true].into_iter().enumerate() {
+        let mut input = invoice("sale", c.id, &format!("cancel-{i}"), "29");
+        if classified {
+            let g = input.gst.as_mut().unwrap();
+            g.classification = Some(SupplyClassification {
+                kind: "exempt".into(),
+                reason: "Synthetic reviewed basis".into(),
+                supplier_state: None,
+            });
+            g.rates_bps[0] = 0;
+        }
+        let original = s.post_document(input).unwrap();
+        s.post_document(serde_json::from_value(json!({"kind":"credit_note","date":"2026-10-02","due_date":null,"party_id":c.id,"invoice_id":original.id,"money_account_id":null,"amount":null,"note":"Full cancellation","lines":[],"return_lines":[{"line":0,"quantity":"1"}],"gst_adjustment_reviewed":if classified {None}else{Some(true)},"request_id":format!("full-credit-{i}")})).unwrap()).unwrap();
+    }
+    let r = draft(&s, "2026-10", "monthly");
+    assert_eq!(r["gstr1_rows"].as_array().unwrap().len(), 4);
+    for section in ["b2cs", "exemp"] {
+        assert_eq!(
+            r["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["section"] == section)
+                .unwrap()["row_count"],
+            0
+        );
+    }
+    assert_eq!(r["gstr3b_book_3_1_a"]["taxable_minor"], "0");
+    assert_eq!(r["gstr3b_book_3_1_c"]["taxable_minor"], "0");
+}
+
+#[test]
+fn reviewed_blocked_and_apportioned_itc_increase_cost_and_only_recoverable_tax_hits_controls() {
+    let (mut s, p, _, supplier) = books();
+    for (key, bps, expense, credit) in [
+        ("blocked", 0, "118000", "0"),
+        ("half", 5000, "109000", "4500"),
+    ] {
+        let mut input = invoice("purchase", supplier.id, key, "29");
+        input.gst.as_mut().unwrap().itc_allocation = Some(ItcAllocation {
+            return_treatment: Some("permanent_reversal".into()),
+            eligible_bps: vec![bps],
+            reason: "Reviewed nonrecoverable/apportioned tax basis".into(),
+        });
+        let d = s.post_document(input.clone()).unwrap();
+        let journal = s.journal(d.journal_id).unwrap();
+        assert_eq!(d.total_minor, "118000");
+        assert_eq!(
+            journal
+                .lines
+                .iter()
+                .find(|l| l.account_id == 8)
+                .unwrap()
+                .amount_minor,
+            expense
+        );
+        assert_eq!(
+            d.gst.as_ref().unwrap().lines[0]
+                .input_credit
+                .as_ref()
+                .unwrap()
+                .cgst_minor,
+            credit
+        );
+        assert_eq!(s.post_document(input).unwrap().id, d.id);
+    }
+    assert_eq!(
+        s.ledger(p.input.cgst, None, None).unwrap().closing_minor,
+        "4500"
+    );
+    assert_eq!(s.ledger(8, None, None).unwrap().closing_minor, "227000");
+    assert_eq!(s.ledger(5, None, None).unwrap().closing_minor, "-236000");
+    let r = draft(&s, "2026-10", "monthly");
+    assert_eq!(r["book_recoverable_input_tax"]["cgst_minor"], "4500");
+    assert_eq!(r["gstr3b_draft_4_a_5"]["cgst_minor"], "18000");
+    assert_eq!(r["gstr3b_draft_4_b_1"]["cgst_minor"], "13500");
+    assert_eq!(r["reconciled"], true);
+    let mut restored = LedgerStore::memory().unwrap();
+    let backup = s.export_backup().unwrap();
+    restored.restore(&backup).unwrap();
+    assert_eq!(draft(&restored, "2026-10", "monthly"), r);
+    let mut bad: Value = serde_json::from_str(&backup).unwrap();
+    bad["business"]["documents"][1]["gst"]["lines"][0]["input_credit"]["cgst_minor"] =
+        json!("4501");
+    assert!(restored.restore(&bad.to_string()).is_err());
+    let mut old: Value = serde_json::from_str(&backup).unwrap();
+    old["version"] = json!(5);
+    assert!(restored.restore(&old.to_string()).is_err());
+}
+#[test]
+fn inventory_cost_and_partial_returns_include_nonrecoverable_gst_without_credit_drift() {
+    let (mut s, p, _, supplier) = books();
+    let asset = s
+        .create_account(AccountInput {
+            code: "1450".into(),
+            name: "Allocated-tax stock".into(),
+            kind: ledger_core::AccountKind::Asset,
+        })
+        .unwrap();
+    let item = s
+        .create_item(ItemInput {
+            code: "ALLOC".into(),
+            name: "Partly eligible stock".into(),
+            unit: "each".into(),
+            asset_account_id: asset.id,
+            expense_account_id: 8,
+        })
+        .unwrap();
+    let mut input = invoice("purchase", supplier.id, "allocated-stock", "29");
+    input.lines[0].quantity = "10".into();
+    input.lines[0].unit_price = "100".into();
+    input.lines[0].account_id = asset.id;
+    input.lines[0].item_id = Some(item.id);
+    input.gst.as_mut().unwrap().itc_allocation = Some(ItcAllocation {
+        return_treatment: Some("permanent_reversal".into()),
+        eligible_bps: vec![5000],
+        reason: "Reviewed half recoverable".into(),
+    });
+    let invoice = s.post_document(input).unwrap();
+    assert_eq!(
+        s.ledger(asset.id, None, None).unwrap().closing_minor,
+        "109000"
+    );
+    for (i, q) in ["3", "7"].into_iter().enumerate() {
+        let note: DocumentInput = serde_json::from_value(json!({"kind":"debit_note","date":"2026-10-02","due_date":null,"party_id":supplier.id,"invoice_id":invoice.id,"money_account_id":null,"amount":null,"note":"Return allocated stock","lines":[],"return_lines":[{"line":0,"quantity":q}],"gst_adjustment_reviewed":true,"request_id":format!("stock-credit-{i}")})).unwrap();
+        let d = s.post_document(note).unwrap();
+        if i == 0 {
+            assert_eq!(d.total_minor, "35400");
+            assert_eq!(d.correction.unwrap().lines[0].inventory_cost_minor, "32700");
+            assert_eq!(
+                s.ledger(p.input.cgst, None, None).unwrap().closing_minor,
+                "3150"
+            );
+        }
+    }
+    assert_eq!(s.ledger(asset.id, None, None).unwrap().closing_minor, "0");
+    assert_eq!(
+        s.ledger(p.input.cgst, None, None).unwrap().closing_minor,
+        "0"
+    );
+    assert_eq!(s.ledger(8, None, None).unwrap().closing_minor, "0");
+    assert_eq!(s.ledger(5, None, None).unwrap().closing_minor, "0");
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&s.export_backup().unwrap()).unwrap();
+    assert_eq!(draft(&restored, "2026-10", "monthly")["reconciled"], true);
+}
+#[test]
+fn tiny_apportioned_return_credit_is_bounded_by_each_returned_tax_component() {
+    let (mut s, p, _, supplier) = books();
+    let mut input = invoice("purchase", supplier.id, "small-itc", "29");
+    input.lines[0].unit_price = "0.33".into();
+    input.gst.as_mut().unwrap().itc_allocation = Some(ItcAllocation {
+        return_treatment: Some("permanent_reversal".into()),
+        eligible_bps: vec![6667],
+        reason: "Reviewed two-thirds allocation".into(),
+    });
+    let invoice = s.post_document(input).unwrap(); // 33 base + 3+3 tax, with 2+2 recoverable.
+    for (i, q) in ["0.2", "0.1", "0.7"].into_iter().enumerate() {
+        let d = s.post_document(serde_json::from_value(json!({"kind":"debit_note","date":"2026-10-02","due_date":null,"party_id":supplier.id,"invoice_id":invoice.id,"money_account_id":null,"amount":null,"note":"Small allocated return","lines":[],"return_lines":[{"line":0,"quantity":q}],"gst_adjustment_reviewed":true,"request_id":format!("small-credit-{i}")})).unwrap()).unwrap();
+        let l = &d.gst.as_ref().unwrap().lines[0];
+        assert!(
+            l.input_credit
+                .as_ref()
+                .unwrap()
+                .cgst_minor
+                .parse::<i64>()
+                .unwrap()
+                <= l.cgst_minor.parse::<i64>().unwrap()
+        );
+    }
+    for id in [p.input.cgst, p.input.sgst, 5, 8] {
+        assert_eq!(s.ledger(id, None, None).unwrap().closing_minor, "0");
+    }
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&s.export_backup().unwrap()).unwrap();
+}
+#[test]
+fn invalid_itc_allocations_are_rejected_without_partial_journals() {
+    let (mut s, _, customer, supplier) = books();
+    let mut base = invoice("purchase", supplier.id, "bad-itc", "29");
+    base.gst.as_mut().unwrap().itc_allocation = Some(ItcAllocation {
+        return_treatment: Some("permanent_reversal".into()),
+        eligible_bps: vec![5000],
+        reason: "Reviewed allocation".into(),
+    });
+    for mutation in 0..4 {
+        let mut d = base.clone();
+        match mutation {
+            0 => {
+                d.gst
+                    .as_mut()
+                    .unwrap()
+                    .itc_allocation
+                    .as_mut()
+                    .unwrap()
+                    .eligible_bps[0] = 10001
+            }
+            1 => d
+                .gst
+                .as_mut()
+                .unwrap()
+                .itc_allocation
+                .as_mut()
+                .unwrap()
+                .eligible_bps
+                .clear(),
+            2 => d
+                .gst
+                .as_mut()
+                .unwrap()
+                .itc_allocation
+                .as_mut()
+                .unwrap()
+                .reason
+                .clear(),
+            _ => {
+                d.kind = "sale".into();
+                d.party_id = Some(customer.id);
+                d.lines[0].account_id = 7;
+                d.gst.as_mut().unwrap().supplier_reference = None;
+                d.gst.as_mut().unwrap().credit_reviewed = false;
+            }
+        }
+        assert!(s.post_document(d).is_err());
+    }
+    assert_eq!(s.snapshot().unwrap().journal_count, 0);
+}
+
+#[test]
+fn itc_draft_separates_excluded_tax_from_unmapped_book_credit_and_keeps_reconciliation_independent()
+{
+    let (mut s, _, _, supplier) = books();
+    for (key, bps, treatment) in [
+        ("excluded", 0, Some("excluded_4d2")),
+        ("unmapped", 5000, None),
+    ] {
+        let mut input = invoice("purchase", supplier.id, key, "29");
+        input.gst.as_mut().unwrap().itc_allocation = Some(ItcAllocation {
+            eligible_bps: vec![bps],
+            reason: "Synthetic reviewed allocation".into(),
+            return_treatment: treatment.map(str::to_owned),
+        });
+        s.post_document(input).unwrap();
+    }
+    let r = draft(&s, "2026-10", "monthly");
+    assert_eq!(r["book_recoverable_input_tax"]["cgst_minor"], "4500");
+    assert_eq!(r["gstr3b_draft_4_a_5"]["cgst_minor"], "0");
+    assert_eq!(r["gstr3b_draft_4_b_1"]["cgst_minor"], "0");
+    assert_eq!(r["gstr3b_draft_4_d_2"]["cgst_minor"], "9000");
+    assert_eq!(
+        r["input_tax_rows"][0]["nonrecoverable_tax"]["cgst_minor"],
+        "9000"
+    );
+    assert_eq!(
+        r["input_tax_rows"][1]["recoverable_tax"]["cgst_minor"],
+        "4500"
+    );
+    assert_eq!(r["reconciled"], true);
+    assert!(
+        r["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "unmapped_itc_return_treatment")
+    );
+}
+
+fn adjustment(invoice: i64, account: i64, key: &str) -> ItcAdjustmentInput {
+    ItcAdjustmentInput {
+        invoice_id: invoice,
+        deferral_id: None,
+        pending_account_id: account,
+        date: "2026-10-02".into(),
+        cgst: "30".into(),
+        sgst: "20".into(),
+        igst: "0".into(),
+        reason: "Synthetic reviewed temporary ITC reversal, not an eligibility determination"
+            .into(),
+        eligibility_reviewed: true,
+        request_id: key.into(),
+    }
+}
+#[test]
+fn temporary_itc_is_linked_bounded_and_reported_on_effective_dates() {
+    let (mut s, p, _, v) = books();
+    let d = s
+        .post_document(invoice("purchase", v.id, "deferred-purchase", "29"))
+        .unwrap();
+    let account = s
+        .create_account(AccountInput {
+            code: "1490".into(),
+            name: "Pending ITC review".into(),
+            kind: ledger_core::AccountKind::Asset,
+        })
+        .unwrap()
+        .id;
+    let input = adjustment(d.id, account, "defer-one");
+    let preview = s.preview_itc_adjustment(input.clone()).unwrap();
+    assert_eq!(preview.total_minor, 5000);
+    let a = s.post_itc_adjustment(input.clone()).unwrap();
+    assert_eq!(s.post_itc_adjustment(input.clone()).unwrap().id, a.id);
+    assert_eq!(s.ledger(account, None, None).unwrap().closing_minor, "5000");
+    assert_eq!(
+        s.ledger(p.input.cgst, None, None).unwrap().closing_minor,
+        "6000"
+    );
+    assert_eq!(s.ledger(5, None, None).unwrap().closing_minor, "-118000");
+    assert_eq!(
+        s.financial_statements(None, None).unwrap().expense_minor,
+        "100000"
+    );
+    let mut claim = input.clone();
+    claim.request_id = "claim-part".into();
+    claim.deferral_id = Some(a.id);
+    claim.date = "2026-11-01".into();
+    claim.cgst = "10".into();
+    claim.sgst = "5".into();
+    s.post_itc_adjustment(claim.clone()).unwrap();
+    let remaining = &s.itc_adjustments(d.id).unwrap()[0].remaining;
+    assert_eq!(remaining.cgst_minor, "2000");
+    assert_eq!(remaining.sgst_minor, "1500");
+    let draft = s
+        .gst_return_draft(GstReturnQuery {
+            period: "2026-10".into(),
+            frequency: "monthly".into(),
+        })
+        .unwrap();
+    assert_eq!(draft.gstr3b_draft_4_b_2.cgst_minor, "3000");
+    assert_eq!(draft.gstr3b_draft_4_c.cgst_minor, "6000");
+    assert_eq!(draft.book_recoverable_input_tax.cgst_minor, "6000");
+    assert!(draft.reconciled);
+    assert!(
+        !draft
+            .issues
+            .iter()
+            .any(|i| i.code.starts_with("manual_gst"))
+    );
+    let next = s
+        .gst_return_draft(GstReturnQuery {
+            period: "2026-11".into(),
+            frequency: "monthly".into(),
+        })
+        .unwrap();
+    assert_eq!(next.gstr3b_draft_4_a_5.cgst_minor, "1000");
+    assert_eq!(next.gstr3b_draft_4_d_1.cgst_minor, "1000");
+    assert_eq!(next.gstr3b_draft_4_c.sgst_minor, "500");
+    assert!(next.reconciled);
+    let backup = s.export_backup().unwrap();
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&backup).unwrap();
+    assert_eq!(restored.post_itc_adjustment(input).unwrap(), a);
+    assert_eq!(
+        restored.post_itc_adjustment(claim.clone()).unwrap().input,
+        claim
+    );
+    let original: Value = serde_json::from_str(&backup).unwrap();
+    for tamper in ["amount", "link", "journal", "missing", "version", "reason"] {
+        let mut b = original.clone();
+        match tamper {
+            "amount" => b["business"]["itc_adjustments"][0]["input"]["cgst"] = json!("31"),
+            "link" => b["business"]["itc_adjustments"][1]["input"]["deferral_id"] = json!(999),
+            "journal" => b["business"]["itc_adjustments"][0]["journal_id"] = json!(d.journal_id),
+            "missing" => b["business"]["itc_adjustments"] = json!([]),
+            "version" => b["version"] = json!(6),
+            _ => b["business"]["itc_adjustments"][0]["input"]["reason"] = json!("Changed basis"),
+        }
+        assert!(
+            LedgerStore::prepare_restore(&b.to_string()).is_err(),
+            "{tamper}"
+        );
+    }
+    let count = s.snapshot().unwrap().journal_count;
+    for change in [
+        "overclaim",
+        "wrong-source",
+        "wrong-account",
+        "unreviewed",
+        "backdate",
+        "retry",
+    ] {
+        let mut bad = claim.clone();
+        bad.request_id = format!("bad-{change}");
+        match change {
+            "overclaim" => bad.cgst = "20.01".into(),
+            "wrong-source" => bad.deferral_id = Some(999),
+            "wrong-account" => bad.pending_account_id = 4,
+            "unreviewed" => bad.eligibility_reviewed = false,
+            "backdate" => bad.date = "2026-10-31".into(),
+            _ => {
+                bad.request_id = "claim-part".into();
+                bad.reason = "Different retry".into();
+            }
+        }
+        assert!(s.post_itc_adjustment(bad).is_err(), "{change}");
+    }
+    assert_eq!(s.snapshot().unwrap().journal_count, count);
+    assert!(
+        s.reverse(a.journal_id, "2026-11-02", "Cannot detach", "rev-itc")
+            .is_err()
+    );
+    assert!(
+        s.reverse(d.journal_id, "2026-11-02", "Cannot detach", "rev-invoice")
+            .is_err()
+    );
+    let mut note: DocumentInput=serde_json::from_value(json!({"kind":"debit_note","date":"2026-11-02","party_id":v.id,"invoice_id":d.id,"due_date":null,"money_account_id":null,"amount":null,"note":"Reviewed supplier return","lines":[],"return_lines":[{"line":0,"quantity":"1"}],"gst_adjustment_reviewed":true,"request_id":"after-itc-return"})).unwrap();
+    assert!(s.post_document(note.clone()).is_err());
+    claim.request_id = "claim-rest".into();
+    claim.cgst = "20".into();
+    claim.sgst = "15".into();
+    claim.date = "2026-11-02".into();
+    s.post_itc_adjustment(claim).unwrap();
+    note.date = "2026-11-03".into();
+    s.post_document(note).unwrap();
+    assert_eq!(s.ledger(account, None, None).unwrap().closing_minor, "0");
+    assert_eq!(
+        s.ledger(p.input.cgst, None, None).unwrap().closing_minor,
+        "0"
+    );
+    let mut later = adjustment(d.id, account, "after-return");
+    later.date = "2026-11-04".into();
+    assert!(s.post_itc_adjustment(later).is_err());
+    restored.restore(&s.export_backup().unwrap()).unwrap();
+    assert_eq!(
+        restored.ledger(account, None, None).unwrap().closing_minor,
+        "0"
+    );
+}
+
+#[test]
+fn deferred_itc_accounts_and_periods_cannot_bypass_accounting_guards() {
+    let (mut s, p, _, v) = books();
+    let mut purchase = invoice("purchase", v.id, "guarded-purchase", "29");
+    purchase.gst.as_mut().unwrap().itc_allocation = Some(ItcAllocation {
+        eligible_bps: vec![5000],
+        return_treatment: Some("permanent_reversal".into()),
+        reason: "Reviewed half recoverable".into(),
+    });
+    let bill = s.post_document(purchase).unwrap();
+    let account = s
+        .create_account(AccountInput {
+            code: "1490".into(),
+            name: "Dedicated pending".into(),
+            kind: ledger_core::AccountKind::Asset,
+        })
+        .unwrap()
+        .id;
+    let mut input = adjustment(bill.id, account, "guarded-deferral");
+    for (component, value) in [("cgst", "45.01"), ("igst", "0.01"), ("sgst", "-1")] {
+        let mut bad = input.clone();
+        bad.request_id = format!("bad-{component}");
+        match component {
+            "cgst" => bad.cgst = value.into(),
+            "igst" => bad.igst = value.into(),
+            _ => bad.sgst = value.into(),
+        };
+        assert!(s.post_itc_adjustment(bad).is_err());
+    }
+    input.pending_account_id = p.input.cgst;
+    assert!(s.post_itc_adjustment(input.clone()).is_err());
+    input.pending_account_id = account;
+    let a = s.post_itc_adjustment(input.clone()).unwrap();
+    assert!(
+        s.create_party(PartyInput {
+            name: "Invalid pending party".into(),
+            kind: "customer".into(),
+            contact: "".into(),
+            account_id: account
+        })
+        .is_err()
+    );
+    assert!(
+        s.create_item(ItemInput {
+            code: "BAD".into(),
+            name: "Invalid pending stock".into(),
+            unit: "each".into(),
+            asset_account_id: account,
+            expense_account_id: 8
+        })
+        .is_err()
+    );
+    assert!(
+        s.post(ledger_core::JournalInput {
+            date: "2026-10-03".into(),
+            reference: "".into(),
+            description: "Unlinked pending movement".into(),
+            request_id: "bad-manual-pending".into(),
+            lines: vec![
+                ledger_core::PostingInput {
+                    account_id: account,
+                    side: ledger_core::Side::Debit,
+                    amount: "1".into()
+                },
+                ledger_core::PostingInput {
+                    account_id: 6,
+                    side: ledger_core::Side::Credit,
+                    amount: "1".into()
+                }
+            ]
+        })
+        .is_err()
+    );
+    s.close_period("2026-04-01", "2026-10-31", 6).unwrap();
+    let mut claim = input.clone();
+    claim.deferral_id = Some(a.id);
+    claim.request_id = "closed-claim".into();
+    assert!(s.post_itc_adjustment(claim.clone()).is_err());
+    claim.date = "2026-11-01".into();
+    s.post_itc_adjustment(claim).unwrap();
+    assert_eq!(s.ledger(account, None, None).unwrap().closing_minor, "0");
+    LedgerStore::prepare_restore(&s.export_backup().unwrap()).unwrap();
+    let mut forged: Value = serde_json::from_str(&s.export_backup().unwrap()).unwrap();
+    forged["journals"].as_array_mut().unwrap().push(json!({"id":999,"source":"manual","date":"2026-11-02","reference":"","description":"Unlinked pending movement","request_id":"forged-pending","created_at":"2026-11-02T00:00:00Z","reversal_of":null,"lines":[{"account_id":account,"side":"debit","amount_minor":"100"},{"account_id":6,"side":"credit","amount_minor":"100"}]}));
+    assert!(LedgerStore::prepare_restore(&forged.to_string()).is_err());
+}
+
+#[test]
+fn temporary_itc_preview_preserves_amounts_above_javascript_safe_integer() {
+    let (mut s, _, _, v) = books();
+    let mut input = invoice("purchase", v.id, "large-itc-purchase", "29");
+    input.lines[0].unit_price = "2000000000000000".into();
+    let bill = s.post_document(input).unwrap();
+    let account = s
+        .create_account(AccountInput {
+            code: "1490".into(),
+            name: "Large pending".into(),
+            kind: ledger_core::AccountKind::Asset,
+        })
+        .unwrap()
+        .id;
+    let mut input = adjustment(bill.id, account, "large-itc-deferral");
+    input.cgst = "90071992547409.93".into();
+    input.sgst = "0".into();
+    let preview = s.preview_itc_adjustment(input.clone()).unwrap();
+    assert_eq!(preview.lines[0].amount_minor, 9007199254740993);
+    s.post_itc_adjustment(input.clone()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.sqlite");
+    let service = LedgerService::open(&path).unwrap();
+    service
+        .request(
+            "restore_backup",
+            json!({"contents":s.export_backup().unwrap()}),
+        )
+        .unwrap();
+    input.deferral_id = Some(1);
+    input.request_id = "large-itc-reclaim".into();
+    input.date = "2026-10-03".into();
+    let preview = service
+        .request(
+            "preview_itc_adjustment",
+            serde_json::to_value(&input).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(preview["lines"][0]["amount_minor"], "9007199254740993");
+    service
+        .request("post_itc_adjustment", serde_json::to_value(&input).unwrap())
+        .unwrap();
+    let ledger = service
+        .request(
+            "ledger",
+            json!({"account_id":account,"from":null,"to":null}),
+        )
+        .unwrap();
+    assert_eq!(ledger["closing_minor"], "0");
+}
+
+#[test]
+fn initial_itc_deferral_stages_purchase_and_hold_atomically_with_stable_retries() {
+    let (mut s, p, _, v) = books();
+    let account = s
+        .create_account(AccountInput {
+            code: "1490".into(),
+            name: "Initial pending".into(),
+            kind: ledger_core::AccountKind::Asset,
+        })
+        .unwrap()
+        .id;
+    let input = DeferredPurchaseInput {
+        document: invoice("purchase", v.id, "initial-pending-purchase", "29"),
+        pending_account_id: account,
+        reason: "Reviewed potential recoverability and temporary reversal conditions".into(),
+        eligibility_reviewed: true,
+    };
+    let mut bad = input.clone();
+    bad.pending_account_id = p.input.cgst;
+    assert!(s.deferred_purchase(bad, true).is_err());
+    assert_eq!(s.snapshot().unwrap().journal_count, 0);
+    let preview = s.deferred_purchase(input.clone(), false).unwrap();
+    assert_eq!(s.snapshot().unwrap().journal_count, 0);
+    assert_eq!(preview["postings"].as_array().unwrap().len(), 2);
+    let posted = s.deferred_purchase(input.clone(), true).unwrap();
+    assert_eq!(posted, s.deferred_purchase(input.clone(), true).unwrap());
+    assert_eq!(s.snapshot().unwrap().journal_count, 2);
+    assert_eq!(
+        s.ledger(p.input.cgst, None, None).unwrap().closing_minor,
+        "0"
+    );
+    assert_eq!(
+        s.ledger(account, None, None).unwrap().closing_minor,
+        "18000"
+    );
+    let draft = s
+        .gst_return_draft(GstReturnQuery {
+            period: "2026-10".into(),
+            frequency: "monthly".into(),
+        })
+        .unwrap();
+    assert_eq!(draft.gstr3b_draft_4_a_5.cgst_minor, "9000");
+    assert_eq!(draft.gstr3b_draft_4_b_2.cgst_minor, "9000");
+    assert_eq!(draft.gstr3b_draft_4_c.cgst_minor, "0");
+    assert!(draft.reconciled);
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&s.export_backup().unwrap()).unwrap();
+    assert_eq!(
+        posted,
+        restored.deferred_purchase(input.clone(), true).unwrap()
+    );
+    let mut changed = input;
+    changed.reason = "Changed original review".into();
+    assert!(s.deferred_purchase(changed, true).is_err());
+    assert_eq!(s.snapshot().unwrap().journal_count, 2);
+}

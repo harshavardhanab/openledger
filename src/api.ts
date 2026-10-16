@@ -50,6 +50,7 @@ export interface Snapshot {
   journal_count: number;
   journal_activity: Record<string, number>;
   trial_balance: TrialBalance;
+  statements: { income_minor: string; expense_minor: string; profit_minor: string };
 }
 export interface LedgerLine {
   journal_id: number;
@@ -61,6 +62,7 @@ export interface LedgerLine {
   balance_minor: string;
 }
 export interface Ledger {
+  line_count?: number;
   account: Account;
   lines: LedgerLine[];
   opening_minor: string;
@@ -105,23 +107,57 @@ export function parseMinor(text: string): bigint | null {
 export function decimal(value: bigint): string {
   return `${value / 100n}.${String(value % 100n).padStart(2, '0')}`;
 }
+export function displayLocale(): string {
+  let preference: string | null = null;
+  try {
+    preference = localStorage.getItem('open-ledger-locale');
+  } catch {
+    // Optional display preferences must not prevent access to the books.
+  }
+  for (const candidate of [preference, navigator.language, 'en-IN']) {
+    if (!candidate) continue;
+    try {
+      const [locale] = Intl.getCanonicalLocales(candidate);
+      if (locale && Intl.NumberFormat.supportedLocalesOf([locale]).length) return locale;
+    } catch {
+      // Some native environments report POSIX values such as C or C.UTF-8.
+    }
+  }
+  return 'en-IN';
+}
 export function money(value: string | bigint, currency: string, symbol = true): string {
   const amount = BigInt(value);
   const absolute = amount < 0n ? -amount : amount;
-  const unit =
-    ({ INR: '₹', USD: '$', EUR: '€', GBP: '£', CAD: 'CA$', AUD: 'A$' } as Record<string, string>)[
-      currency
-    ] || currency;
-  return `${amount < 0n ? '−' : ''}${symbol ? `${unit} ` : ''}${String(absolute / 100n).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${String(absolute % 100n).padStart(2, '0')}`;
+  const locale = displayLocale();
+  const parts = new Intl.NumberFormat(locale, {
+    style: 'currency',
+    currency,
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).formatToParts(absolute / 100n);
+  const fraction = String(absolute % 100n).padStart(2, '0');
+  const rendered = parts
+    .filter((p) => symbol || (p.type !== 'currency' && p.type !== 'literal'))
+    .map((p) => (p.type === 'fraction' ? fraction : p.value))
+    .join('');
+  return `${amount < 0n ? '−' : ''}${rendered}`;
 }
 export function displayDate(value: string): string {
-  return new Date(`${value}T12:00:00`).toLocaleDateString('en-GB', {
+  return new Date(`${value}T12:00:00`).toLocaleDateString(displayLocale(), {
     day: 'numeric',
     month: 'short',
     year: 'numeric',
   });
 }
-export function download(name: string, contents: string, type = 'application/json') {
+export async function download(name: string, contents: string, type = 'application/json') {
+  if (desktop()) {
+    try {
+      await window.__TAURI__!.core.invoke('save_export', { filename: name, contents });
+    } catch (e) {
+      window.dispatchEvent(new CustomEvent('open-ledger-error', { detail: String(e) }));
+    }
+    return;
+  }
   const url = URL.createObjectURL(new Blob([contents], { type }));
   const a = document.createElement('a');
   a.href = url;
@@ -135,7 +171,12 @@ export function csv(rows: (string | number)[][]) {
       row
         .map((cell) => {
           let value = String(cell);
-          if (typeof cell === 'string' && /^[=+@\-]/.test(value)) value = `'${value}`;
+          if (
+            typeof cell === 'string' &&
+            /^\s*[=+@\-]/.test(value) &&
+            !/^-?\d+(?:\.\d+)?$/.test(value)
+          )
+            value = `'${value}`;
           return `"${value.replaceAll('"', '""')}"`;
         })
         .join(','),
