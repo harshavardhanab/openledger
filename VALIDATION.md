@@ -1,6 +1,10 @@
 # Roadmap implementation validation — 16 October 2026
 
-## Returns and accessibility extension
+## GST return-preparation extension
+
+The current extension adds monthly/quarterly draft GSTR-1 CSVs, GSTR-3B book worksheets, HSN review and six-account tax reconciliation. Local locked Rust tests (51 total), strict TypeScript/Vite and Clippy pass. Browser workflows now verify draft JSON/CSV contents, unresolved-period errors, WCAG scans and narrow reflow. The official offline template archive hash and precise scope are in [GST_RETURNS.md](docs/GST_RETURNS.md). New application source requires fresh platform CI and native-package evidence; the earlier candidate runs below do not validate this extension.
+
+## Returns and accessibility extension — earlier source
 
 Current work extends the earlier candidate below with linked quantity returns/cancellation, customer/supplier refunds, original-cost sales stock returns, weighted-average purchase return variances, explicit GST-adjustment review, tax-register links, and schema/backup version 4 with versions 1–3 compatibility.
 

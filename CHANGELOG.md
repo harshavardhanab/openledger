@@ -3,6 +3,7 @@
 ## Unreleased roadmap implementation
 
 - Customers and suppliers; exact sales/purchase invoices and linked partial settlements.
+- Monthly/quarterly GST draft preparation: GSTR-1 candidate CSVs, GSTR-3B book worksheet, HSN review and GST-control reconciliation with unresolved source/rounding items.
 - India GST registration, reviewed per-line rates/HSN, component tax postings, reviewed purchase ITC and register exports.
 - Linked partial/full invoice returns, stock cost restoration/variance, explicit GST-adjustment review and customer/supplier refunds.
 - Document numbering, local drafts, review, native exports and printable HTML.

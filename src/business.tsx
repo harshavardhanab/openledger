@@ -1,3 +1,4 @@
+import { GstReturns } from './gst-returns';
 import React, { useEffect, useState, useId, useRef } from 'react';
 import {
   Account,
@@ -1742,7 +1743,12 @@ function Statements({ state, onError, gstConfigured }: Props & { gstConfigured: 
     );
   return (
     <>
-      {gstConfigured && <GstReport state={state} onError={onError} />}
+      {gstConfigured && (
+        <>
+          <GstReturns state={state} />
+          <GstReport state={state} onError={onError} />
+        </>
+      )}
       <section className="panel filter-panel">
         <Field name="Profit and loss from">
           <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />

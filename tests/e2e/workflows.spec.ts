@@ -557,6 +557,47 @@ test('India GST setup, invoice tax and register work through the interface', asy
   await expect(
     page.getByRole('heading', { name: 'GST accounting register', exact: true }),
   ).toBeVisible();
+  await page.getByRole('button', { name: 'Prepare GST return draft', exact: true }).click();
+  await expect(
+    page.getByRole('status').filter({ hasText: 'GST control activity matches' }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole('heading', { name: 'GSTR-1 candidate sections', exact: true }),
+  ).toBeVisible();
+  const draftDownload = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export complete GST draft (JSON)', exact: true }).click();
+  const draftFile = await draftDownload;
+  const draft = JSON.parse(readFileSync((await draftFile.path())!, 'utf8'));
+  expect(draft.format).toBe('open-ledger-gst-return-draft');
+  expect(draft.filing_ready).toBe(false);
+  expect(draft.reconciled).toBe(true);
+  expect(draft.gstr1_sections.b2cs.cgst_minor).toBe('9000');
+  expect(
+    draft.reconciliation.every((r: { difference_minor: string }) => r.difference_minor === '0'),
+  ).toBe(true);
+  const csvDownload = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export draft B2CS (1)', exact: true }).click();
+  const csvFile = await csvDownload;
+  expect(csvFile.suggestedFilename()).toContain('DRAFT-gstr1');
+  expect(readFileSync((await csvFile.path())!, 'utf8')).toContain(
+    '"OE","29-Karnataka","18.00","","1000.00"',
+  );
+  expect(
+    (await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze())
+      .violations,
+  ).toEqual([]);
+  await page.setViewportSize({ width: 320, height: 900 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.getByLabel('GST return month / quarter end').fill('2026-10');
+  await page.getByLabel('GST return frequency').selectOption('quarterly');
+  await page.getByRole('button', { name: 'Prepare GST return draft', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('quarter-end');
+  await expect(
+    page.getByRole('heading', { name: 'GSTR-1 candidate sections', exact: true }),
+  ).toHaveCount(0);
   const download = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Export GST register', exact: true }).click();
   expect((await download).suggestedFilename()).toContain('gst-register');

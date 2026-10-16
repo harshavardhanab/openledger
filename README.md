@@ -12,7 +12,7 @@ A free, open-source, local accounting application written in Rust, React, and Ta
 - Create customers/suppliers, post sales/purchase invoices, record linked partial receipts/payments, and inspect outstanding balances.
 - Post linked partial/full invoice returns, cancel remaining quantities, and refund customer/supplier credits with stock and GST adjustments. See [returns and refunds](docs/RETURNS.md).
 - Configure document numbering, save local drafts, export HTML documents, and print to PDF.
-- Calculate scoped domestic regular India GST (CGST, SGST/UTGST or IGST), post reviewed input credits, and export a GST accounting register. See [India GST scope](docs/INDIA_GST.md).
+- Calculate scoped domestic regular India GST (CGST, SGST/UTGST or IGST), post reviewed input credits, export a GST accounting register, and prepare draft GSTR-1 CSVs / GSTR-3B book worksheets with tax-control reconciliation. See [India GST scope](docs/INDIA_GST.md).
 - Track fractional inventory units, stock adjustments and movement history with perpetual weighted average costing.
 - Reconcile bank statements, report profit/loss and balance sheets, and close consecutive financial periods to equity.
 - Preview and atomically import documented JSON journal batches or explicitly mapped simple Tally XML general vouchers (experimental, version compatibility unverified).

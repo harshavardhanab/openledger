@@ -112,6 +112,9 @@ impl LedgerService {
                 json!({"saved":true})
             }
             "gst_control_accounts" => store.gst_control_accounts()?,
+            "gst_return_draft" => {
+                serde_json::to_value(store.gst_return_draft(serde_json::from_value(payload)?)?)?
+            }
             "gst_report" => {
                 let input: GstReportQuery = serde_json::from_value(payload)?;
                 store.gst_report(&input.from, &input.to)?
