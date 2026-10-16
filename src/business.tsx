@@ -288,6 +288,7 @@ function Documents(
       <div className="panel filter-panel">
         <button
           className="button primary"
+          disabled={busy}
           onClick={() => {
             setCompose('sale');
             setSettle(null);
@@ -297,6 +298,7 @@ function Documents(
         </button>
         <button
           className="button secondary"
+          disabled={busy}
           onClick={() => {
             setCompose('purchase');
             setSettle(null);
@@ -414,6 +416,7 @@ function Documents(
                         BigInt(d.credited_minor) < BigInt(d.total_minor) && (
                           <button
                             className="text-button"
+                            disabled={busy}
                             onClick={() => {
                               setCompose(null);
                               setReturnInvoice(d);
@@ -425,6 +428,7 @@ function Documents(
                       {!d.reversed && BigInt(d.outstanding_minor) < 0n && (
                         <button
                           className="text-button"
+                          disabled={busy}
                           onClick={() => {
                             setSettle(d);
                             setReturnInvoice(null);
@@ -439,6 +443,7 @@ function Documents(
                       {!d.reversed && BigInt(d.outstanding_minor) > 0n && (
                         <button
                           className="text-button"
+                          disabled={busy}
                           onClick={() => {
                             setSettle(d);
                             setCompose(d.input.kind === 'sale' ? 'receipt' : 'payment');
