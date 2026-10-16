@@ -161,7 +161,7 @@ pub fn decimal_amount(minor: i64) -> String {
     format!("{}.{:02}", minor / 100, minor % 100)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PostingInput {
     pub account_id: i64,
