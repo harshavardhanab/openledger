@@ -30,7 +30,44 @@ pub struct SupplyClassification {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct ItcAllocation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_treatment: Option<String>,
+    pub eligible_bps: Vec<u32>,
+    pub reason: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InputCredit {
+    pub cgst_minor: String,
+    pub sgst_minor: String,
+    pub igst_minor: String,
+}
+impl InputCredit {
+    pub(crate) fn values(&self) -> Result<[i64; 3]> {
+        let parse = |n: &str| {
+            n.parse()
+                .map_err(|_| invalid("Invalid stored input credit."))
+        };
+        Ok([
+            parse(&self.cgst_minor)?,
+            parse(&self.sgst_minor)?,
+            parse(&self.igst_minor)?,
+        ])
+    }
+    pub(crate) fn from_values(n: [i64; 3]) -> Self {
+        Self {
+            cgst_minor: n[0].to_string(),
+            sgst_minor: n[1].to_string(),
+            igst_minor: n[2].to_string(),
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GstInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub itc_allocation: Option<ItcAllocation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classification: Option<SupplyClassification>,
     pub supply_state: String,
@@ -46,6 +83,8 @@ pub struct GstInput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GstLine {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_credit: Option<InputCredit>,
     pub taxable_minor: String,
     pub rate_bps: u32,
     pub hsn_sac: String,
@@ -144,6 +183,27 @@ pub(crate) fn calculate_gst(
     let Some(g) = &d.gst else {
         return Ok(None);
     };
+    if let Some(itc) = &g.itc_allocation {
+        if d.kind != "purchase"
+            || g.classification.is_some()
+            || itc.eligible_bps.len() != d.lines.len()
+            || itc.eligible_bps.iter().any(|n| *n > 10000)
+        {
+            return Err(invalid(
+                "Reviewed ITC allocations apply only to regular taxable purchases, with a 0–100% eligible share for each line.",
+            ));
+        }
+        clean_text(&itc.reason, "Reviewed ITC allocation basis", 500, true)?;
+        if itc
+            .return_treatment
+            .as_deref()
+            .is_some_and(|s| !["permanent_reversal", "excluded_4d2"].contains(&s))
+        {
+            return Err(invalid(
+                "Select reviewed permanent reversal, excluded 4(D)(2), or leave return mapping pending.",
+            ));
+        }
+    }
     if let Some(c) = &g.classification {
         if !["sale", "purchase"].contains(&d.kind.as_str())
             || !["nil_rated", "exempt", "non_gst"].contains(&c.kind.as_str())
@@ -267,6 +327,12 @@ pub(crate) fn calculate_gst(
         total.2 += i128::from(s);
         total.3 += i128::from(i);
         lines.push(GstLine {
+            input_credit: g.itc_allocation.as_ref().map(|a| {
+                InputCredit::from_values([c, s, i].map(|n| {
+                    ((i128::from(n) * i128::from(a.eligible_bps[lines.len()]) + 5000) / 10000)
+                        as i64
+                }))
+            }),
             taxable_minor: base.to_string(),
             rate_bps: rate,
             hsn_sac: code.clone(),
@@ -287,6 +353,52 @@ pub(crate) fn calculate_gst(
         calc,
         if d.kind == "sale" { p.output } else { p.input },
     )))
+}
+impl GstLine {
+    pub(crate) fn credit_values(&self) -> Result<[i64; 3]> {
+        self.input_credit
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| InputCredit {
+                cgst_minor: self.cgst_minor.clone(),
+                sgst_minor: self.sgst_minor.clone(),
+                igst_minor: self.igst_minor.clone(),
+            })
+            .values()
+    }
+    pub(crate) fn nonrecoverable(&self) -> Result<i64> {
+        let credit = self.credit_values()?;
+        let full = InputCredit {
+            cgst_minor: self.cgst_minor.clone(),
+            sgst_minor: self.sgst_minor.clone(),
+            igst_minor: self.igst_minor.clone(),
+        }
+        .values()?;
+        let mut n = 0i64;
+        for i in 0..3 {
+            if credit[i] < 0 || credit[i] > full[i] {
+                return Err(invalid("Input credit exceeds the invoice tax."));
+            }
+            n = n
+                .checked_add(full[i] - credit[i])
+                .ok_or_else(|| invalid("Nonrecoverable tax exceeds range."))?;
+        }
+        Ok(n)
+    }
+}
+impl GstCalculation {
+    pub(crate) fn credit_values(&self) -> Result<[i64; 3]> {
+        let mut sum = [0i64; 3];
+        for l in &self.lines {
+            let n = l.credit_values()?;
+            for i in 0..3 {
+                sum[i] = sum[i]
+                    .checked_add(n[i])
+                    .ok_or_else(|| invalid("Input credit exceeds range."))?;
+            }
+        }
+        Ok(sum)
+    }
 }
 impl LedgerStore {
     pub fn configure_gst(&mut self, p: GstProfile) -> Result<()> {
@@ -401,22 +513,29 @@ impl LedgerStore {
                         .taxable_minor
                         .parse::<i128>()
                         .map_err(|_| invalid("Invalid stored GST."))?;
-                total.1 += sign
-                    * calc
-                        .cgst_minor
-                        .parse::<i128>()
-                        .map_err(|_| invalid("Invalid stored GST."))?;
-                total.2 += sign
-                    * calc
-                        .sgst_minor
-                        .parse::<i128>()
-                        .map_err(|_| invalid("Invalid stored GST."))?;
-                total.3 += sign
-                    * calc
-                        .igst_minor
-                        .parse::<i128>()
-                        .map_err(|_| invalid("Invalid stored GST."))?;
-                rows.push(serde_json::json!({"document_id":d.id,"number":d.number,"original_invoice":source.as_ref().map(|s| &s.number),"supplier_reference":g.supplier_reference,"kind":d.input.kind,"classification":g.classification.as_ref().map(|c|c.kind.as_str()).unwrap_or("regular"),"classification_basis":g.classification.as_ref().map(|c|c.reason.as_str()),"date":date,"event":event,"sign":sign,"counterparty_gstin":g.counterparty_gstin,"supply_state":g.supply_state,"supply_state_name":g.supply_state_name,"amounts":calc}));
+                if original.input.kind == "purchase" {
+                    let credit = calc.credit_values()?;
+                    total.1 += sign * i128::from(credit[0]);
+                    total.2 += sign * i128::from(credit[1]);
+                    total.3 += sign * i128::from(credit[2]);
+                } else {
+                    total.1 += sign
+                        * calc
+                            .cgst_minor
+                            .parse::<i128>()
+                            .map_err(|_| invalid("Invalid stored GST."))?;
+                    total.2 += sign
+                        * calc
+                            .sgst_minor
+                            .parse::<i128>()
+                            .map_err(|_| invalid("Invalid stored GST."))?;
+                    total.3 += sign
+                        * calc
+                            .igst_minor
+                            .parse::<i128>()
+                            .map_err(|_| invalid("Invalid stored GST."))?;
+                }
+                rows.push(serde_json::json!({"document_id":d.id,"number":d.number,"original_invoice":source.as_ref().map(|s| &s.number),"supplier_reference":g.supplier_reference,"kind":d.input.kind,"classification":g.classification.as_ref().map(|c|c.kind.as_str()).unwrap_or("regular"),"classification_basis":g.classification.as_ref().map(|c|c.reason.as_str()),"itc_allocation":g.itc_allocation,"date":date,"event":event,"sign":sign,"counterparty_gstin":g.counterparty_gstin,"supply_state":g.supply_state,"supply_state_name":g.supply_state_name,"amounts":calc}));
             }
         }
         let totals=totals.into_iter().map(|(k,(b,c,s,i))|(k,serde_json::json!({"taxable_minor":b.to_string(),"cgst_minor":c.to_string(),"sgst_minor":s.to_string(),"igst_minor":i.to_string()}))).collect::<std::collections::BTreeMap<_,_>>();

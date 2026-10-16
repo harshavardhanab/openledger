@@ -42,6 +42,7 @@ fn invoice(kind: &str, party: i64, key: &str, state: &str) -> DocumentInput {
         return_lines: None,
         reviewed_postings: None,
         gst: Some(GstInput {
+            itc_allocation: None,
             classification: None,
             supply_state: state.into(),
             supply_state_name: if state == "29" {
@@ -711,6 +712,8 @@ fn classified_zero_tax_supplies_post_without_tax_and_flow_to_separate_draft_sect
     restored.restore(&backup).unwrap();
     assert_eq!(draft(&restored, "2026-10", "monthly"), r);
     let mut old: Value = serde_json::from_str(&backup).unwrap();
+    old["version"] = json!(5);
+    restored.restore(&old.to_string()).unwrap();
     old["version"] = json!(4);
     assert!(restored.restore(&old.to_string()).is_err());
     let mut bad: Value = serde_json::from_str(&backup).unwrap();
@@ -794,7 +797,7 @@ fn v4_backup_and_database_migration_preserve_regular_gst_retry_identity() {
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        5
+        6
     );
 }
 
@@ -842,7 +845,7 @@ fn classified_inward_supplies_use_reviewed_supplier_state_without_claiming_input
     assert_eq!(r["gstr3b_book_5"][0]["inter_state_minor"], "75000");
     assert_eq!(r["gstr3b_book_5"][0]["intra_state_minor"], "100000");
     assert_eq!(r["gstr3b_book_5"][1]["inter_state_minor"], "100000");
-    assert_eq!(r["gstr3b_book_4_a_5"]["igst_minor"], "0");
+    assert_eq!(r["gstr3b_draft_4_a_5"]["igst_minor"], "0");
     assert_eq!(r["reconciled"], true);
     let mut restored = LedgerStore::memory().unwrap();
     restored.restore(&s.export_backup().unwrap()).unwrap();
@@ -881,4 +884,240 @@ fn fully_credited_consumer_and_exempt_groups_keep_audit_rows_without_empty_csv_d
     }
     assert_eq!(r["gstr3b_book_3_1_a"]["taxable_minor"], "0");
     assert_eq!(r["gstr3b_book_3_1_c"]["taxable_minor"], "0");
+}
+
+#[test]
+fn reviewed_blocked_and_apportioned_itc_increase_cost_and_only_recoverable_tax_hits_controls() {
+    let (mut s, p, _, supplier) = books();
+    for (key, bps, expense, credit) in [
+        ("blocked", 0, "118000", "0"),
+        ("half", 5000, "109000", "4500"),
+    ] {
+        let mut input = invoice("purchase", supplier.id, key, "29");
+        input.gst.as_mut().unwrap().itc_allocation = Some(ItcAllocation {
+            return_treatment: Some("permanent_reversal".into()),
+            eligible_bps: vec![bps],
+            reason: "Reviewed nonrecoverable/apportioned tax basis".into(),
+        });
+        let d = s.post_document(input.clone()).unwrap();
+        let journal = s.journal(d.journal_id).unwrap();
+        assert_eq!(d.total_minor, "118000");
+        assert_eq!(
+            journal
+                .lines
+                .iter()
+                .find(|l| l.account_id == 8)
+                .unwrap()
+                .amount_minor,
+            expense
+        );
+        assert_eq!(
+            d.gst.as_ref().unwrap().lines[0]
+                .input_credit
+                .as_ref()
+                .unwrap()
+                .cgst_minor,
+            credit
+        );
+        assert_eq!(s.post_document(input).unwrap().id, d.id);
+    }
+    assert_eq!(
+        s.ledger(p.input.cgst, None, None).unwrap().closing_minor,
+        "4500"
+    );
+    assert_eq!(s.ledger(8, None, None).unwrap().closing_minor, "227000");
+    assert_eq!(s.ledger(5, None, None).unwrap().closing_minor, "-236000");
+    let r = draft(&s, "2026-10", "monthly");
+    assert_eq!(r["book_recoverable_input_tax"]["cgst_minor"], "4500");
+    assert_eq!(r["gstr3b_draft_4_a_5"]["cgst_minor"], "18000");
+    assert_eq!(r["gstr3b_draft_4_b_1"]["cgst_minor"], "13500");
+    assert_eq!(r["reconciled"], true);
+    let mut restored = LedgerStore::memory().unwrap();
+    let backup = s.export_backup().unwrap();
+    restored.restore(&backup).unwrap();
+    assert_eq!(draft(&restored, "2026-10", "monthly"), r);
+    let mut bad: Value = serde_json::from_str(&backup).unwrap();
+    bad["business"]["documents"][1]["gst"]["lines"][0]["input_credit"]["cgst_minor"] =
+        json!("4501");
+    assert!(restored.restore(&bad.to_string()).is_err());
+    let mut old: Value = serde_json::from_str(&backup).unwrap();
+    old["version"] = json!(5);
+    assert!(restored.restore(&old.to_string()).is_err());
+}
+#[test]
+fn inventory_cost_and_partial_returns_include_nonrecoverable_gst_without_credit_drift() {
+    let (mut s, p, _, supplier) = books();
+    let asset = s
+        .create_account(AccountInput {
+            code: "1450".into(),
+            name: "Allocated-tax stock".into(),
+            kind: ledger_core::AccountKind::Asset,
+        })
+        .unwrap();
+    let item = s
+        .create_item(ItemInput {
+            code: "ALLOC".into(),
+            name: "Partly eligible stock".into(),
+            unit: "each".into(),
+            asset_account_id: asset.id,
+            expense_account_id: 8,
+        })
+        .unwrap();
+    let mut input = invoice("purchase", supplier.id, "allocated-stock", "29");
+    input.lines[0].quantity = "10".into();
+    input.lines[0].unit_price = "100".into();
+    input.lines[0].account_id = asset.id;
+    input.lines[0].item_id = Some(item.id);
+    input.gst.as_mut().unwrap().itc_allocation = Some(ItcAllocation {
+        return_treatment: Some("permanent_reversal".into()),
+        eligible_bps: vec![5000],
+        reason: "Reviewed half recoverable".into(),
+    });
+    let invoice = s.post_document(input).unwrap();
+    assert_eq!(
+        s.ledger(asset.id, None, None).unwrap().closing_minor,
+        "109000"
+    );
+    for (i, q) in ["3", "7"].into_iter().enumerate() {
+        let note: DocumentInput = serde_json::from_value(json!({"kind":"debit_note","date":"2026-10-02","due_date":null,"party_id":supplier.id,"invoice_id":invoice.id,"money_account_id":null,"amount":null,"note":"Return allocated stock","lines":[],"return_lines":[{"line":0,"quantity":q}],"gst_adjustment_reviewed":true,"request_id":format!("stock-credit-{i}")})).unwrap();
+        let d = s.post_document(note).unwrap();
+        if i == 0 {
+            assert_eq!(d.total_minor, "35400");
+            assert_eq!(d.correction.unwrap().lines[0].inventory_cost_minor, "32700");
+            assert_eq!(
+                s.ledger(p.input.cgst, None, None).unwrap().closing_minor,
+                "3150"
+            );
+        }
+    }
+    assert_eq!(s.ledger(asset.id, None, None).unwrap().closing_minor, "0");
+    assert_eq!(
+        s.ledger(p.input.cgst, None, None).unwrap().closing_minor,
+        "0"
+    );
+    assert_eq!(s.ledger(8, None, None).unwrap().closing_minor, "0");
+    assert_eq!(s.ledger(5, None, None).unwrap().closing_minor, "0");
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&s.export_backup().unwrap()).unwrap();
+    assert_eq!(draft(&restored, "2026-10", "monthly")["reconciled"], true);
+}
+#[test]
+fn tiny_apportioned_return_credit_is_bounded_by_each_returned_tax_component() {
+    let (mut s, p, _, supplier) = books();
+    let mut input = invoice("purchase", supplier.id, "small-itc", "29");
+    input.lines[0].unit_price = "0.33".into();
+    input.gst.as_mut().unwrap().itc_allocation = Some(ItcAllocation {
+        return_treatment: Some("permanent_reversal".into()),
+        eligible_bps: vec![6667],
+        reason: "Reviewed two-thirds allocation".into(),
+    });
+    let invoice = s.post_document(input).unwrap(); // 33 base + 3+3 tax, with 2+2 recoverable.
+    for (i, q) in ["0.2", "0.1", "0.7"].into_iter().enumerate() {
+        let d = s.post_document(serde_json::from_value(json!({"kind":"debit_note","date":"2026-10-02","due_date":null,"party_id":supplier.id,"invoice_id":invoice.id,"money_account_id":null,"amount":null,"note":"Small allocated return","lines":[],"return_lines":[{"line":0,"quantity":q}],"gst_adjustment_reviewed":true,"request_id":format!("small-credit-{i}")})).unwrap()).unwrap();
+        let l = &d.gst.as_ref().unwrap().lines[0];
+        assert!(
+            l.input_credit
+                .as_ref()
+                .unwrap()
+                .cgst_minor
+                .parse::<i64>()
+                .unwrap()
+                <= l.cgst_minor.parse::<i64>().unwrap()
+        );
+    }
+    for id in [p.input.cgst, p.input.sgst, 5, 8] {
+        assert_eq!(s.ledger(id, None, None).unwrap().closing_minor, "0");
+    }
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&s.export_backup().unwrap()).unwrap();
+}
+#[test]
+fn invalid_itc_allocations_are_rejected_without_partial_journals() {
+    let (mut s, _, customer, supplier) = books();
+    let mut base = invoice("purchase", supplier.id, "bad-itc", "29");
+    base.gst.as_mut().unwrap().itc_allocation = Some(ItcAllocation {
+        return_treatment: Some("permanent_reversal".into()),
+        eligible_bps: vec![5000],
+        reason: "Reviewed allocation".into(),
+    });
+    for mutation in 0..4 {
+        let mut d = base.clone();
+        match mutation {
+            0 => {
+                d.gst
+                    .as_mut()
+                    .unwrap()
+                    .itc_allocation
+                    .as_mut()
+                    .unwrap()
+                    .eligible_bps[0] = 10001
+            }
+            1 => d
+                .gst
+                .as_mut()
+                .unwrap()
+                .itc_allocation
+                .as_mut()
+                .unwrap()
+                .eligible_bps
+                .clear(),
+            2 => d
+                .gst
+                .as_mut()
+                .unwrap()
+                .itc_allocation
+                .as_mut()
+                .unwrap()
+                .reason
+                .clear(),
+            _ => {
+                d.kind = "sale".into();
+                d.party_id = Some(customer.id);
+                d.lines[0].account_id = 7;
+                d.gst.as_mut().unwrap().supplier_reference = None;
+                d.gst.as_mut().unwrap().credit_reviewed = false;
+            }
+        }
+        assert!(s.post_document(d).is_err());
+    }
+    assert_eq!(s.snapshot().unwrap().journal_count, 0);
+}
+
+#[test]
+fn itc_draft_separates_excluded_tax_from_unmapped_book_credit_and_keeps_reconciliation_independent()
+{
+    let (mut s, _, _, supplier) = books();
+    for (key, bps, treatment) in [
+        ("excluded", 0, Some("excluded_4d2")),
+        ("unmapped", 5000, None),
+    ] {
+        let mut input = invoice("purchase", supplier.id, key, "29");
+        input.gst.as_mut().unwrap().itc_allocation = Some(ItcAllocation {
+            eligible_bps: vec![bps],
+            reason: "Synthetic reviewed allocation".into(),
+            return_treatment: treatment.map(str::to_owned),
+        });
+        s.post_document(input).unwrap();
+    }
+    let r = draft(&s, "2026-10", "monthly");
+    assert_eq!(r["book_recoverable_input_tax"]["cgst_minor"], "4500");
+    assert_eq!(r["gstr3b_draft_4_a_5"]["cgst_minor"], "0");
+    assert_eq!(r["gstr3b_draft_4_b_1"]["cgst_minor"], "0");
+    assert_eq!(r["gstr3b_draft_4_d_2"]["cgst_minor"], "9000");
+    assert_eq!(
+        r["input_tax_rows"][0]["nonrecoverable_tax"]["cgst_minor"],
+        "9000"
+    );
+    assert_eq!(
+        r["input_tax_rows"][1]["recoverable_tax"]["cgst_minor"],
+        "4500"
+    );
+    assert_eq!(r["reconciled"], true);
+    assert!(
+        r["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "unmapped_itc_return_treatment")
+    );
 }

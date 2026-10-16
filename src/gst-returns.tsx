@@ -21,7 +21,19 @@ type Draft = {
   gstr3b_book_3_1_a: Amounts;
   gstr3b_book_3_1_c: Amounts;
   gstr3b_book_3_1_e: Amounts;
-  gstr3b_book_4_a_5: Amounts;
+  gstr3b_draft_4_a_5: Amounts;
+  gstr3b_draft_4_b_1: Amounts;
+  gstr3b_draft_4_d_2: Amounts;
+  book_recoverable_input_tax: Amounts;
+  input_tax_rows: {
+    number: string;
+    date: string;
+    event: string;
+    invoice_tax: Amounts;
+    recoverable_tax: Amounts;
+    nonrecoverable_tax: Amounts;
+    allocation?: { return_treatment?: string; reason: string } | null;
+  }[];
   gstr3b_book_5: { category: string; inter_state_minor: string; intra_state_minor: string }[];
   gstr3b_book_3_2_unregistered: Record<string, Amounts>;
   reconciliation: {
@@ -44,6 +56,7 @@ export function GstReturns({ state }: { state: Snapshot }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [issuePage, setIssuePage] = useState(0);
+  const [inputPage, setInputPage] = useState(0);
   // A report must never survive a change of books, dates or accounting data.
   useEffect(() => {
     generation.current++;
@@ -51,6 +64,7 @@ export function GstReturns({ state }: { state: Snapshot }) {
     setDraft(null);
     setError('');
     setIssuePage(0);
+    setInputPage(0);
     return () => {
       generation.current++;
     };
@@ -138,8 +152,23 @@ export function GstReturns({ state }: { state: Snapshot }) {
               { label: '3.1(c) · Nil-rated / exempt outward supplies', ...draft.gstr3b_book_3_1_c },
               { label: '3.1(e) · Non-GST outward supplies', ...draft.gstr3b_book_3_1_e },
               {
-                label: '4(A)(5) · Book input credit before GSTR-2B/IMS review',
-                ...draft.gstr3b_book_4_a_5,
+                label: '4(A)(5) · Draft other ITC before GSTR-2B/IMS review',
+                ...draft.gstr3b_draft_4_a_5,
+                taxable_minor: '',
+              },
+              {
+                label: '4(B)(1) · Draft reviewed permanent reversals',
+                ...draft.gstr3b_draft_4_b_1,
+                taxable_minor: '',
+              },
+              {
+                label: '4(D)(2) · Draft reviewed excluded ineligible tax',
+                ...draft.gstr3b_draft_4_d_2,
+                taxable_minor: '',
+              },
+              {
+                label: 'Recoverable input tax in books',
+                ...draft.book_recoverable_input_tax,
                 taxable_minor: '',
               },
               ...Object.entries(draft.gstr3b_book_3_2_unregistered).map(([state, a]) => ({
@@ -169,6 +198,67 @@ export function GstReturns({ state }: { state: Snapshot }) {
               </tbody>
             </table>
           </div>
+          {draft.input_tax_rows.length > 0 && (
+            <details>
+              <summary>Input tax source details ({draft.input_tax_rows.length})</summary>
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Document / event</th>
+                      <th>Invoice tax</th>
+                      <th>Recoverable</th>
+                      <th>Nonrecoverable</th>
+                      <th>Reviewed mapping / basis</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {draft.input_tax_rows
+                      .slice(inputPage * 50, inputPage * 50 + 50)
+                      .map((r, index) => {
+                        const total = (a: Amounts) =>
+                          BigInt(a.cgst_minor) + BigInt(a.sgst_minor) + BigInt(a.igst_minor);
+                        return (
+                          <tr key={`${r.number}-${r.event}-${index}`}>
+                            <td>
+                              {r.number} · {r.date} · {r.event.replaceAll('_', ' ')}
+                            </td>
+                            <td>{money(total(r.invoice_tax), 'INR')}</td>
+                            <td>{money(total(r.recoverable_tax), 'INR')}</td>
+                            <td>{money(total(r.nonrecoverable_tax), 'INR')}</td>
+                            <td>
+                              {r.allocation
+                                ? `${r.allocation.return_treatment?.replaceAll('_', ' ') || 'Mapping pending'} · ${r.allocation.reason}`
+                                : 'Reviewed recoverable purchase'}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                  </tbody>
+                </table>
+              </div>
+              <div className="business-actions">
+                <button
+                  className="button secondary"
+                  disabled={inputPage === 0}
+                  onClick={() => setInputPage((n) => n - 1)}
+                >
+                  Previous input tax rows
+                </button>
+                <span>
+                  {inputPage * 50 + 1}–{Math.min(inputPage * 50 + 50, draft.input_tax_rows.length)}{' '}
+                  of {draft.input_tax_rows.length}
+                </span>
+                <button
+                  className="button secondary"
+                  disabled={(inputPage + 1) * 50 >= draft.input_tax_rows.length}
+                  onClick={() => setInputPage((n) => n + 1)}
+                >
+                  Next input tax rows
+                </button>
+              </div>
+            </details>
+          )}
           <h4>GST control reconciliation</h4>
           <div className="table-scroll">
             <table>

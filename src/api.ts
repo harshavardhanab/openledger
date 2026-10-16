@@ -173,7 +173,7 @@ export function csv(rows: (string | number)[][]) {
           let value = String(cell);
           if (
             typeof cell === 'string' &&
-            /^[=+@\-]/.test(value) &&
+            /^\s*[=+@\-]/.test(value) &&
             !/^-?\d+(?:\.\d+)?$/.test(value)
           )
             value = `'${value}`;

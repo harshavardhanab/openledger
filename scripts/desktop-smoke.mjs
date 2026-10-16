@@ -246,14 +246,49 @@ try {
     ],
     request_id: 'native-exempt',
   });
+  const taxSupplier = await invoke('create_party', {
+    name: 'Native ITC supplier',
+    kind: 'supplier',
+    contact: '',
+    account_id: 5,
+  });
+  await invoke('post_document', {
+    ...invoiceInput,
+    kind: 'purchase',
+    party_id: taxSupplier.id,
+    date: '2026-10-04',
+    due_date: '2026-10-04',
+    gst: {
+      ...gst,
+      counterparty_gstin: '29ABCDE1234F1Z5',
+      supplier_reference: 'NATIVE-ITC',
+      credit_reviewed: true,
+      itc_allocation: {
+        eligible_bps: [5000],
+        reason: 'Synthetic reviewed allocation',
+        return_treatment: 'permanent_reversal',
+      },
+    },
+    lines: [
+      {
+        description: 'Apportioned purchase',
+        quantity: '1',
+        unit_price: '100',
+        account_id: 8,
+        item_id: null,
+      },
+    ],
+    request_id: 'native-apportioned',
+  });
   const taxDraft = await invoke('gst_return_draft', { period: '2026-10', frequency: 'monthly' });
+  assert.equal(taxDraft.book_recoverable_input_tax.cgst_minor, '450');
   assert.equal(taxDraft.gstr3b_book_3_1_a.taxable_minor, '10000');
   assert.equal(taxDraft.gstr3b_book_3_1_c.taxable_minor, '5000');
   assert.equal(taxDraft.gstr1_sections.exemp.taxable_minor, '5000');
   assert.equal(taxDraft.reconciled, true);
   assert.equal(taxDraft.filing_ready, false);
   const classifiedBackup = await invoke('backup');
-  assert.equal(JSON.parse(classifiedBackup).version, 5);
+  assert.equal(JSON.parse(classifiedBackup).version, 6);
   await invoke('restore_backup', { contents: classifiedBackup });
   assert.deepEqual(
     await invoke('gst_return_draft', { period: '2026-10', frequency: 'monthly' }),

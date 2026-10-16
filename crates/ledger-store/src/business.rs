@@ -522,8 +522,9 @@ fn prepare_document(
         Some(account)
     };
     let mut seen = BTreeSet::new();
+    let gst = crate::gst::calculate_gst(tx, d)?;
     let mut total = 0i128;
-    for line in &d.lines {
+    for (index, line) in d.lines.iter().enumerate() {
         clean_text(&line.description, "Line description", 200, true)?;
         let qty = parse_quantity(&line.quantity)?;
         let price = parse_amount(&line.unit_price)?;
@@ -532,6 +533,18 @@ fn prepare_document(
             return Err(invalid("A line amount rounds to zero."));
         }
         total += i128::from(value);
+        let value = if d.kind == "purchase" {
+            value
+                .checked_add(
+                    gst.as_ref()
+                        .map(|(calc, _)| calc.lines[index].nonrecoverable())
+                        .transpose()?
+                        .unwrap_or(0),
+                )
+                .ok_or_else(|| invalid("Purchase cost exceeds range."))?
+        } else {
+            value
+        };
         let side = if d.kind == "sale" {
             Side::Credit
         } else {
@@ -664,12 +677,16 @@ fn prepare_document(
     if result.total <= 0 {
         return Err(invalid("Document total must be positive."));
     }
-    if let Some((calc, accounts)) = crate::gst::calculate_gst(tx, d)? {
-        for (id, minor) in [
+    if let Some((calc, accounts)) = gst {
+        let recoverable = calc.credit_values()?;
+        for (index, (id, minor)) in [
             (accounts.cgst, &calc.cgst_minor),
             (accounts.sgst, &calc.sgst_minor),
             (accounts.igst, &calc.igst_minor),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let n = minor
                 .parse::<i64>()
                 .map_err(|_| invalid("Invalid GST total."))?;
@@ -678,6 +695,14 @@ fn prepare_document(
                     .total
                     .checked_add(n)
                     .ok_or_else(|| invalid("Invoice total exceeds range."))?;
+                let n = if d.kind == "purchase" {
+                    recoverable[index]
+                } else {
+                    n
+                };
+                if n == 0 {
+                    continue;
+                }
                 result.lines.push(PostingInput {
                     account_id: id,
                     side: if d.kind == "sale" {

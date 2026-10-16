@@ -182,6 +182,7 @@ pub(crate) fn prepare_correction(
     let mut details = vec![];
     let mut taxes = vec![];
     let mut tax_totals = [0i64; 4];
+    let mut credit_totals = [0i64; 3];
     let mut gross = 0i128;
     for selection in returns {
         if !seen.insert(selection.line) {
@@ -211,6 +212,46 @@ pub(crate) fn prepare_correction(
         };
         let credit = proportional(base, prior, qty, whole, true)?;
         gross += i128::from(credit);
+        let mut values = [credit, 0, 0, 0];
+        let mut eligible = [0i64; 3];
+        let mut nonrecoverable = 0i64;
+        if let Some(calc) = &orig.gst {
+            let g = &calc.lines[selection.line];
+            let original_credit = g.credit_values()?;
+            for (i, n) in [&g.cgst_minor, &g.sgst_minor, &g.igst_minor]
+                .into_iter()
+                .enumerate()
+            {
+                let full = minor(n)?;
+                let previous = proportional(full, 0, prior, whole, true)?;
+                values[i + 1] = proportional(full, prior, qty, whole, true)?;
+                gross += i128::from(values[i + 1]);
+                // Allocate credit by cumulative returned TAX units, not independently
+                // by quantity: a component cannot refund more credit than its tax.
+                eligible[i] = if full == 0 {
+                    0
+                } else {
+                    proportional(original_credit[i], previous, values[i + 1], full, false)?
+                };
+                let blocked = values[i + 1]
+                    .checked_sub(eligible[i])
+                    .filter(|n| *n >= 0)
+                    .ok_or_else(|| invalid("Return credit exceeds tax."))?;
+                nonrecoverable = nonrecoverable
+                    .checked_add(blocked)
+                    .ok_or_else(|| invalid("Return cost exceeds range."))?;
+                credit_totals[i] = credit_totals[i]
+                    .checked_add(eligible[i])
+                    .ok_or_else(|| invalid("Return credit exceeds range."))?;
+            }
+        }
+        let cost_credit = if sale {
+            credit
+        } else {
+            credit
+                .checked_add(nonrecoverable)
+                .ok_or_else(|| invalid("Return cost exceeds range."))?
+        };
         let mut cost = 0;
         if let Some(item) = l.item_id {
             let latest: Option<String> = tx.query_row(
@@ -260,7 +301,7 @@ pub(crate) fn prepare_correction(
                     .map_err(|_| invalid("Stock value exceeds range."))?
                 };
                 push(&mut prepared.lines, asset, Side::Credit, cost);
-                let difference = i128::from(cost) - i128::from(credit);
+                let difference = i128::from(cost) - i128::from(cost_credit);
                 let variance = i64::try_from(difference.abs())
                     .map_err(|_| invalid("Return variance exceeds range."))?;
                 push(
@@ -280,25 +321,21 @@ pub(crate) fn prepare_correction(
                 &mut prepared.lines,
                 l.account_id,
                 if sale { Side::Debit } else { Side::Credit },
-                credit,
+                cost_credit,
             );
         }
         if let Some(calc) = &orig.gst {
             let g = &calc.lines[selection.line];
-            let mut values = [credit, 0, 0, 0];
-            for (i, n) in [&g.cgst_minor, &g.sgst_minor, &g.igst_minor]
-                .iter()
-                .enumerate()
-            {
-                values[i + 1] = proportional(minor(n)?, prior, qty, whole, true)?;
-                gross += i128::from(values[i + 1]);
-            }
             for i in 0..4 {
                 tax_totals[i] = tax_totals[i]
                     .checked_add(values[i])
                     .ok_or_else(|| invalid("Return tax exceeds range."))?;
             }
             taxes.push(GstLine {
+                input_credit: g
+                    .input_credit
+                    .as_ref()
+                    .map(|_| crate::InputCredit::from_values(eligible)),
                 taxable_minor: credit.to_string(),
                 rate_bps: g.rate_bps,
                 hsn_sac: g.hsn_sac.clone(),
@@ -324,9 +361,30 @@ pub(crate) fn prepare_correction(
         let profile: GstProfile = serde_json::from_str(&raw)?;
         let accounts = if sale { profile.output } else { profile.input };
         for (id, n) in [
-            (accounts.cgst, tax_totals[1]),
-            (accounts.sgst, tax_totals[2]),
-            (accounts.igst, tax_totals[3]),
+            (
+                accounts.cgst,
+                if sale {
+                    tax_totals[1]
+                } else {
+                    credit_totals[0]
+                },
+            ),
+            (
+                accounts.sgst,
+                if sale {
+                    tax_totals[2]
+                } else {
+                    credit_totals[1]
+                },
+            ),
+            (
+                accounts.igst,
+                if sale {
+                    tax_totals[3]
+                } else {
+                    credit_totals[2]
+                },
+            ),
         ] {
             push(
                 &mut prepared.lines,

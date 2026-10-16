@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { csv } from '../../src/api';
 import AxeBuilder from '@axe-core/playwright';
 import { test, expect, Page, APIRequestContext } from '@playwright/test';
 async function api(request: APIRequestContext, command: string, payload: object = {}) {
@@ -752,10 +753,116 @@ test('reviewed nil-rated, exempt and non-GST bills export separately and retain 
   expect(draft.gstr3b_book_3_1_e.taxable_minor).toBe('100000');
   expect(draft.gstr1_sections.exemp.taxable_minor).toBe('250000');
   expect(draft.gstr3b_book_5[0].inter_state_minor).toBe('100000');
-  expect(draft.gstr3b_book_4_a_5.igst_minor).toBe('0');
+  expect(draft.gstr3b_draft_4_a_5.igst_minor).toBe('0');
   expect(draft.issues).toEqual([]);
   expect(
     (await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze())
       .violations,
   ).toEqual([]);
+});
+
+test('blocked and apportioned purchase ITC increases cost and returns reverse only reviewed credit', async ({
+  page,
+  request,
+}) => {
+  expect(csv([['\t=1+1', '  +1+1', '-12.50', 'plain,quoted']])).toBe(
+    '"\'\t=1+1","\'  +1+1","-12.50","plain,quoted"',
+  );
+  await company(page, request, 'ITC allocation UI');
+  const controls = await api(request, 'gst_control_accounts');
+  await api(request, 'configure_gst', {
+    gstin: '29ABCDE1234F1Z5',
+    state_code: '29',
+    state_name: 'Karnataka',
+    address: 'Synthetic office',
+    ...controls,
+  });
+  await api(request, 'create_party', {
+    name: 'ITC supplier',
+    kind: 'supplier',
+    contact: '',
+    account_id: 5,
+  });
+  await page.reload();
+  await nav(page, 'Invoices & settlements');
+  for (const treatment of ['blocked', 'apportioned']) {
+    await page.getByRole('button', { name: 'New purchase invoice', exact: true }).click();
+    await page.getByLabel('Supplier', { exact: true }).selectOption({ label: 'ITC supplier' });
+    await page.getByLabel('Description', { exact: true }).fill('Reviewed purchase cost');
+    await page.getByLabel('Unit price', { exact: true }).fill('1000');
+    await page.getByLabel('Posting account').selectOption('8');
+    await page.getByRole('checkbox', { name: 'Record India tax details', exact: true }).check();
+    await page.getByLabel('Supplier GSTIN', { exact: true }).fill('29ABCDE1234F1Z5');
+    await page
+      .getByLabel('Supplier tax invoice reference')
+      .fill(treatment === 'blocked' ? 'BLOCKED-1' : 'PARTIAL-1');
+    await page.getByLabel('Counterparty postal address').fill('Synthetic supplier');
+    await page.getByLabel('Delivery address').fill('Synthetic recipient');
+    await page.getByLabel('Reviewed GST rate (%)', { exact: true }).fill('18');
+    await page.getByLabel('HSN / SAC', { exact: true }).fill('998314');
+    await page.getByLabel('Purchase input tax treatment').selectOption(treatment);
+    await page.getByLabel('Reviewed ITC return treatment').selectOption('permanent_reversal');
+    await page
+      .getByLabel('Reviewed ITC allocation basis')
+      .fill('Synthetic independently reviewed treatment');
+    if (treatment === 'apportioned') await page.getByLabel('Reviewed eligible ITC (%)').fill('50');
+    await page
+      .getByRole('checkbox', {
+        name: 'I independently reviewed input tax credit eligibility.',
+        exact: true,
+      })
+      .check();
+    await page.getByRole('button', { name: 'Review document', exact: true }).click();
+    await expect(page.getByText('Total: ₹1,180.00', { exact: true })).toBeVisible();
+    await expect(page.getByText(/Reviewed recoverable input tax:/)).toContainText(
+      treatment === 'blocked' ? '₹180.00' : '₹90.00',
+    );
+    await page.getByRole('button', { name: 'Post purchase invoice', exact: true }).click();
+    await expect(
+      page.getByRole('button', {
+        name: treatment === 'blocked' ? 'BILL-000001' : 'BILL-000002',
+        exact: true,
+      }),
+    ).toBeVisible();
+  }
+  expect(
+    (await api(request, 'ledger', { account_id: 8, from: null, to: null })).closing_minor,
+  ).toBe('227000');
+  const row = page
+    .getByRole('row')
+    .filter({ has: page.getByRole('button', { name: 'BILL-000002', exact: true }) });
+  await row.getByRole('button', { name: 'Return / cancel', exact: true }).click();
+  await page.getByLabel('Return reason').fill('Return half of apportioned purchase');
+  await page.getByLabel(/Return quantity 1:/).fill('0.5');
+  await page.getByRole('checkbox', { name: /I reviewed GST adjustment eligibility/ }).check();
+  await page.getByRole('button', { name: 'Review return', exact: true }).click();
+  await expect(page.getByLabel('Invoice return')).toContainText('₹590.00');
+  await expect(page.getByText(/Reviewed recoverable input tax:/)).toContainText('₹45.00');
+  await page.getByRole('button', { name: 'Post return note', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'DN-000001', exact: true })).toBeVisible();
+  const input = await api(request, 'gst_return_draft', {
+    period: await page.evaluate(() => {
+      const d = new Date();
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    }),
+    frequency: 'monthly',
+  });
+  expect(input.book_recoverable_input_tax.cgst_minor).toBe('2250');
+  expect(input.gstr3b_draft_4_a_5.cgst_minor).toBe('13500');
+  expect(input.gstr3b_draft_4_b_1.cgst_minor).toBe('11250');
+  await nav(page, 'Financial statements');
+  await page.getByRole('button', { name: 'Prepare GST return draft', exact: true }).click();
+  await page.getByText('Input tax source details (3)', { exact: true }).click();
+  await expect(page.getByRole('cell', { name: /permanent reversal/ }).first()).toBeVisible();
+  expect(
+    (await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze())
+      .violations,
+  ).toEqual([]);
+  expect(input.reconciled).toBe(true);
+  const backup = await api(request, 'backup');
+  expect(JSON.parse(backup).version).toBe(6);
+  await api(request, 'restore_backup', { contents: backup });
+  expect(
+    (await api(request, 'ledger', { account_id: 8, from: null, to: null })).closing_minor,
+  ).toBe('172500');
 });

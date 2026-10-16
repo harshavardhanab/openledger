@@ -184,7 +184,7 @@ impl LedgerStore {
         conn.busy_timeout(Duration::from_secs(5))?;
         let app_id: i64 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if app_id != 1330399058 || !(1..=5).contains(&version) {
+        if app_id != 1330399058 || !(1..=6).contains(&version) {
             return Err(invalid(
                 "Books file is unsupported or belongs to another application.",
             ));
@@ -202,7 +202,7 @@ impl LedgerStore {
         if app_id != 0 && app_id != 1330399058 {
             return Err(invalid("This file belongs to a different application."));
         }
-        if version > 5 {
+        if version > 6 {
             return Err(invalid(
                 "This database needs a newer version of Open Ledger.",
             ));
@@ -247,6 +247,9 @@ impl LedgerStore {
         }
         if version < 5 {
             conn.execute_batch(include_str!("migration_v5.sql"))?;
+        }
+        if version < 6 {
+            conn.execute_batch(include_str!("migration_v6.sql"))?;
         }
         if wal {
             conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -671,7 +674,7 @@ impl LedgerStore {
         }
         Ok(serde_json::to_string_pretty(&Backup {
             format: "open-ledger-backup".into(),
-            version: 5,
+            version: 6,
             exported_at: now(),
             company,
             accounts,
@@ -695,7 +698,7 @@ impl LedgerStore {
             ));
         }
         let mut backup: Backup = serde_json::from_value(raw)?;
-        if backup.format != "open-ledger-backup" || !(1..=5).contains(&backup.version) {
+        if backup.format != "open-ledger-backup" || !(1..=6).contains(&backup.version) {
             return Err(invalid("This is not a supported Open Ledger backup."));
         }
         if backup.version == 1 && !backup.business.is_empty() {
@@ -712,6 +715,25 @@ impl LedgerStore {
                     .any(|d| d.gst.is_some() || d.input.gst.is_some()))
         {
             return Err(invalid("GST records require backup version 3."));
+        }
+        if backup.version < 6
+            && backup.business.documents.iter().any(|d| {
+                d.input
+                    .gst
+                    .as_ref()
+                    .is_some_and(|g| g.itc_allocation.is_some())
+                    || d.gst
+                        .as_ref()
+                        .is_some_and(|g| g.lines.iter().any(|l| l.input_credit.is_some()))
+                    || d.correction
+                        .as_ref()
+                        .and_then(|c| c.original_gst.as_ref())
+                        .is_some_and(|g| g.itc_allocation.is_some())
+            })
+        {
+            return Err(invalid(
+                "Reviewed ITC allocations require backup version 6.",
+            ));
         }
         if backup.version < 5
             && backup.business.documents.iter().any(|d| {

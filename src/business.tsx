@@ -48,6 +48,7 @@ type GstProfile = {
   input: GstAccounts;
 };
 type GstInput = {
+  itc_allocation?: { eligible_bps: number[]; reason: string; return_treatment?: string };
   classification?: { kind: string; reason: string; supplier_state?: string };
   supply_state: string;
   supply_state_name: string;
@@ -65,6 +66,7 @@ type GstCalculation = {
   sgst_minor: string;
   igst_minor: string;
   lines: {
+    input_credit?: { cgst_minor: string; sgst_minor: string; igst_minor: string };
     taxable_minor: string;
     rate_bps: number;
     hsn_sac: string;
@@ -73,7 +75,7 @@ type GstCalculation = {
     igst_minor: string;
   }[];
 };
-type ComposerLine = DocLine & { gst_rate?: string; hsn_sac?: string };
+type ComposerLine = DocLine & { gst_rate?: string; hsn_sac?: string; itc_rate?: string };
 type ReturnLine = { line: number; quantity: string };
 type Correction = {
   invoice_number: string;
@@ -969,8 +971,22 @@ function DocumentComposer({
     [taxAddress, setTaxAddress] = useState(''),
     [delivery, setDelivery] = useState(''),
     [supplierRef, setSupplierRef] = useState(''),
-    [creditReviewed, setCreditReviewed] = useState(false);
+    [creditReviewed, setCreditReviewed] = useState(false),
+    [itcMode, setItcMode] = useState('eligible'),
+    [itcBasis, setItcBasis] = useState(''),
+    [itcReturnTreatment, setItcReturnTreatment] = useState('');
   const gstInput: GstInput = {
+    ...(kind === 'purchase' && supplyKind === 'regular' && itcMode !== 'eligible'
+      ? {
+          itc_allocation: {
+            reason: itcBasis,
+            ...(itcReturnTreatment ? { return_treatment: itcReturnTreatment } : {}),
+            eligible_bps: lines.map((l) =>
+              itcMode === 'blocked' ? 0 : Number(parseMinor(l.itc_rate || '') || 0n),
+            ),
+          },
+        }
+      : {}),
     ...(supplyKind !== 'regular'
       ? {
           classification: {
@@ -992,22 +1008,46 @@ function DocumentComposer({
     ),
     hsn_sac: lines.map((l) => l.hsn_sac || ''),
   };
-  const gstPreview = () => {
-    let c = 0n,
-      i = 0n;
+  const gstPreview = (): GstCalculation => {
     const local = (kind === 'sale' ? data.gst?.state_code : gstin.slice(0, 2)) === supplyState;
-    for (const l of lines) {
+    const calculated = lines.map((l) => {
       const base = lineTotal(l),
         rate = supplyKind === 'regular' ? parseMinor(l.gst_rate || '') || 0n : 0n;
-      if (local) c += (base * rate + 10000n) / 20000n;
-      else i += (base * rate + 5000n) / 10000n;
-    }
+      const cgst = local ? (base * rate + 10000n) / 20000n : 0n;
+      const igst = local ? 0n : (base * rate + 5000n) / 10000n;
+      const rawEligible = gstInput.itc_allocation
+        ? itcMode === 'blocked'
+          ? 0n
+          : parseMinor(l.itc_rate || '') || 0n
+        : 10000n;
+      const eligible = rawEligible > 10000n ? 10000n : rawEligible;
+      const share = (n: bigint) => ((n * eligible + 5000n) / 10000n).toString();
+      return {
+        taxable_minor: base.toString(),
+        cgst_minor: cgst.toString(),
+        sgst_minor: cgst.toString(),
+        igst_minor: igst.toString(),
+        rate_bps: Number(rate),
+        hsn_sac: l.hsn_sac || '',
+        ...(gstInput.itc_allocation
+          ? {
+              input_credit: {
+                cgst_minor: share(cgst),
+                sgst_minor: share(cgst),
+                igst_minor: share(igst),
+              },
+            }
+          : {}),
+      };
+    });
+    const sum = (key: 'taxable_minor' | 'cgst_minor' | 'sgst_minor' | 'igst_minor') =>
+      calculated.reduce((n, l) => n + BigInt(l[key]), 0n).toString();
     return {
-      cgst_minor: c.toString(),
-      sgst_minor: c.toString(),
-      igst_minor: i.toString(),
-      taxable_minor: lines.reduce((v, l) => v + lineTotal(l), 0n).toString(),
-      lines: [],
+      taxable_minor: sum('taxable_minor'),
+      cgst_minor: sum('cgst_minor'),
+      sgst_minor: sum('sgst_minor'),
+      igst_minor: sum('igst_minor'),
+      lines: calculated,
     };
   };
   const calculatedGst = gstEnabled ? gstPreview() : null;
@@ -1021,7 +1061,7 @@ function DocumentComposer({
     money_account_id: settlement ? bank : null,
     amount: settlement ? amount : null,
     note,
-    lines: settlement ? [] : lines.map(({ gst_rate, hsn_sac, ...line }) => line),
+    lines: settlement ? [] : lines.map(({ gst_rate, hsn_sac, itc_rate, ...line }) => line),
     request_id: requestId,
   };
   const total = settlement
@@ -1069,7 +1109,11 @@ function DocumentComposer({
         d.lines.map((l, i) => ({
           ...l,
           ...(d.gst
-            ? { gst_rate: decimal(BigInt(d.gst.rates_bps[i])), hsn_sac: d.gst.hsn_sac[i] }
+            ? {
+                gst_rate: decimal(BigInt(d.gst.rates_bps[i])),
+                hsn_sac: d.gst.hsn_sac[i],
+                itc_rate: decimal(BigInt(d.gst.itc_allocation?.eligible_bps[i] ?? 10000)),
+              }
             : {}),
         })),
       );
@@ -1085,6 +1129,15 @@ function DocumentComposer({
         setDelivery(d.gst.delivery_address);
         setSupplierRef(d.gst.supplier_reference || '');
         setCreditReviewed(d.gst.credit_reviewed);
+        setItcMode(
+          d.gst.itc_allocation
+            ? d.gst.itc_allocation.eligible_bps.every((n) => n === 0)
+              ? 'blocked'
+              : 'apportioned'
+            : 'eligible',
+        );
+        setItcBasis(d.gst.itc_allocation?.reason || '');
+        setItcReturnTreatment(d.gst.itc_allocation?.return_treatment || '');
       }
       setRequestId(d.request_id);
     } catch {
@@ -1376,6 +1429,43 @@ function DocumentComposer({
                     )}
                   </div>
                   {kind === 'purchase' && supplyKind === 'regular' && (
+                    <div className="business-grid">
+                      <Field name="Purchase input tax treatment">
+                        <select value={itcMode} onChange={(e) => setItcMode(e.target.value)}>
+                          <option value="eligible">Fully reviewed recoverable credit</option>
+                          <option value="blocked">Blocked / ineligible credit</option>
+                          <option value="apportioned">Reviewed apportioned credit</option>
+                        </select>
+                      </Field>
+                      {itcMode !== 'eligible' && (
+                        <>
+                          <Field name="Reviewed ITC return treatment">
+                            <select
+                              value={itcReturnTreatment}
+                              onChange={(e) => setItcReturnTreatment(e.target.value)}
+                            >
+                              <option value="">Return mapping pending review</option>
+                              <option value="permanent_reversal">
+                                Permanent reversal · 4(B)(1)
+                              </option>
+                              <option value="excluded_4d2">
+                                Excluded ineligible tax · 4(D)(2)
+                              </option>
+                            </select>
+                          </Field>
+                          <Field name="Reviewed ITC allocation basis">
+                            <input
+                              required
+                              maxLength={500}
+                              value={itcBasis}
+                              onChange={(e) => setItcBasis(e.target.value)}
+                            />
+                          </Field>
+                        </>
+                      )}
+                    </div>
+                  )}
+                  {kind === 'purchase' && supplyKind === 'regular' && (
                     <label className="checkbox-label">
                       <input
                         required
@@ -1441,11 +1531,30 @@ function DocumentComposer({
                           <input
                             required
                             inputMode="decimal"
+                            type="number"
+                            min="0.01"
+                            max="100"
+                            step="0.01"
                             value={supplyKind === 'regular' ? l.gst_rate || '' : '0.00'}
                             disabled={supplyKind !== 'regular'}
                             onChange={(e) => patch(i, { gst_rate: e.target.value })}
                           />
                         </Field>
+                        {kind === 'purchase' &&
+                          supplyKind === 'regular' &&
+                          itcMode === 'apportioned' && (
+                            <Field name="Reviewed eligible ITC (%)">
+                              <input
+                                required
+                                type="number"
+                                min="0"
+                                max="100"
+                                step="0.01"
+                                value={l.itc_rate || ''}
+                                onChange={(e) => patch(i, { itc_rate: e.target.value })}
+                              />
+                            </Field>
+                          )}
                         <Field name="HSN / SAC">
                           <input
                             required
@@ -2429,9 +2538,14 @@ function exportDocument(d: Doc, data: Business, state: Snapshot, print = false) 
       ? `<p>Supply classification: ${escape(classified.kind.replace('_', ' '))} · Reviewed basis: ${escape(classified.reason)}</p><table><thead><tr><th>HSN/SAC</th><th>Value of supply</th></tr></thead><tbody>${d.gst.lines.map((l) => `<tr><td>${escape(l.hsn_sac)}</td><td>${escape(money(l.taxable_minor, currency))}</td></tr>`).join('')}</tbody></table><p>No GST charged.</p>`
       : `<table><thead><tr><th>HSN/SAC</th><th>Rate %</th><th>Taxable</th><th>CGST</th><th>SGST/UTGST</th><th>IGST</th></tr></thead><tbody>${d.gst.lines.map((l) => `<tr><td>${escape(l.hsn_sac)}</td><td>${escape(decimal(BigInt(l.rate_bps)))}</td><td>${escape(money(l.taxable_minor, currency))}</td><td>${escape(money(l.cgst_minor, currency))}</td><td>${escape(money(l.sgst_minor, currency))}</td><td>${escape(money(l.igst_minor, currency))}</td></tr>`).join('')}</tbody></table><p>Taxable: ${escape(money(d.gst.taxable_minor, currency))} · CGST: ${escape(money(d.gst.cgst_minor, currency))} · SGST/UTGST: ${escape(money(d.gst.sgst_minor, currency))} · IGST: ${escape(money(d.gst.igst_minor, currency))}</p>`
     : '';
+  const creditSummary = d.gst ? inputCreditAmounts(d.gst) : null;
+  const itcHtml =
+    creditSummary && g?.itc_allocation
+      ? `<p>Reviewed input credit: ${escape(money(creditSummary.recoverable, currency))} · Nonrecoverable tax in expense/asset cost: ${escape(money(creditSummary.nonrecoverable, currency))} · Review basis: ${escape(g.itc_allocation.reason)}</p>`
+      : '';
   const gstHtml =
     d.gst && g && data.gst
-      ? `<h3>${classified ? 'Supply particulars' : 'India GST invoice particulars'}</h3><p>Supplier: ${escape(isSale ? state.company!.name : party?.input.name || '')} · Registration: ${escape(isSale ? data.gst.gstin : g.counterparty_gstin || '')} · ${escape(isSale ? data.gst.address : g.counterparty_address)}</p><p>Recipient registration: ${escape(isSale ? g.counterparty_gstin || 'Unregistered' : data.gst.gstin)} · ${escape(isSale ? g.counterparty_address : data.gst.address)}</p><p>Place of supply: ${escape(g.supply_state_name)} (${escape(g.supply_state)}) · Delivery: ${escape(g.delivery_address)}</p>${g.supplier_reference ? `<p>Supplier invoice: ${escape(g.supplier_reference)}</p>` : ''}${taxDetails}<p>Reverse charge: No · Supplier authorization/signature: __________________</p>`
+      ? `<h3>${classified ? 'Supply particulars' : 'India GST invoice particulars'}</h3><p>Supplier: ${escape(isSale ? state.company!.name : party?.input.name || '')} · Registration: ${escape(isSale ? data.gst.gstin : g.counterparty_gstin || '')} · ${escape(isSale ? data.gst.address : g.counterparty_address)}</p><p>Recipient registration: ${escape(isSale ? g.counterparty_gstin || 'Unregistered' : data.gst.gstin)} · ${escape(isSale ? g.counterparty_address : data.gst.address)}</p><p>Place of supply: ${escape(g.supply_state_name)} (${escape(g.supply_state)}) · Delivery: ${escape(g.delivery_address)}</p>${g.supplier_reference ? `<p>Supplier invoice: ${escape(g.supplier_reference)}</p>` : ''}${taxDetails}${itcHtml}<p>Reverse charge: No · Supplier authorization/signature: __________________</p>`
       : '';
   const html = `<!doctype html><html lang="en"><meta charset="utf-8"><title>${escape(d.number)}</title><style>body{font:16px system-ui;color:#20372e;max-width:850px;margin:48px auto;padding:24px}table{width:100%;border-collapse:collapse;margin:32px 0}td,th{text-align:left;border-bottom:1px solid #ddd;padding:12px}small{color:#667}</style><h1>${escape(state.company!.name)}</h1><h2>${escape(documentTitle)} ${escape(d.number)}</h2><p>${escape(d.input.date)}${d.input.due_date ? ` · Due ${escape(d.input.due_date)}` : ''}${d.reversed ? ' · REVERSED' : ''}</p><h3>${escape(party?.input.name || '')}</h3><p>${escape(party?.input.contact || '')}</p><table><thead><tr><th>Description</th><th>Quantity</th><th>Unit price</th><th>Amount</th></tr></thead><tbody>${(d.correction?.lines || d.input.lines).map((l) => `<tr><td>${escape(l.description)}</td><td>${escape(l.quantity)} ${escape(data.items.find((i) => i.id === l.item_id)?.input.unit || '')}</td><td>${escape(money(parseMinor(l.unit_price) || 0n, currency))}</td><td>${escape(money('taxable_minor' in l ? String(l.taxable_minor) : lineTotal(l), currency))}</td></tr>`).join('')}</tbody></table>${d.correction ? `<p>Linked original invoice: ${escape(d.correction.invoice_number)} · ${escape(d.correction.invoice_date)}</p><p>Amounts reduce the original invoice.${d.input.kind === 'debit_note' ? ' Purchase return notes record the buyer’s commercial adjustment; review the supplier’s statutory credit note separately.' : ''}</p>` : ''}${gstHtml}<h3>Total ${escape(money(d.total_minor, currency))}</h3><p>${escape(d.input.note)}</p><small>${d.gst ? 'Open Ledger · India tax accounting · Review legal particulars and supplier authorization before issue' : 'Open Ledger · General accounting document · No GST calculation'}</small></html>`;
   if (print) {
@@ -2463,21 +2577,41 @@ function SupplyClass({ gst }: { gst?: GstInput | null }) {
     </p>
   );
 }
+function inputCreditAmounts(calc: GstCalculation) {
+  if (!calc.lines.some((l) => l.input_credit)) return null;
+  let recoverable = 0n,
+    full = 0n;
+  for (const l of calc.lines)
+    for (const k of ['cgst_minor', 'sgst_minor', 'igst_minor'] as const) {
+      full += BigInt(l[k]);
+      recoverable += BigInt(l.input_credit?.[k] ?? l[k]);
+    }
+  return { recoverable, nonrecoverable: full - recoverable };
+}
 function GstAmounts({ calc, currency }: { calc: GstCalculation; currency: string }) {
+  const credit = inputCreditAmounts(calc);
   return (
-    <div className="ledger-summary">
-      {[
-        ['Value before tax', calc.taxable_minor],
-        ['CGST', calc.cgst_minor],
-        ['SGST / UTGST', calc.sgst_minor],
-        ['IGST', calc.igst_minor],
-      ].map(([name, value]) => (
-        <div key={name}>
-          <span>{name}</span>
-          <strong>{money(value, currency)}</strong>
-        </div>
-      ))}
-    </div>
+    <>
+      <div className="ledger-summary">
+        {[
+          ['Value before tax', calc.taxable_minor],
+          ['CGST', calc.cgst_minor],
+          ['SGST / UTGST', calc.sgst_minor],
+          ['IGST', calc.igst_minor],
+        ].map(([name, value]) => (
+          <div key={name}>
+            <span>{name}</span>
+            <strong>{money(value, currency)}</strong>
+          </div>
+        ))}
+      </div>
+      {credit && (
+        <p>
+          Reviewed recoverable input tax: {money(credit.recoverable, currency)} · Nonrecoverable tax
+          included in expense / asset cost: {money(credit.nonrecoverable, currency)}
+        </p>
+      )}
+    </>
   );
 }
 function GstSettings({ state, data, busy, mutate }: Props & { data: Business }) {
@@ -2615,6 +2749,7 @@ function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) =
         original_invoice: string | null;
         classification: string;
         classification_basis: string | null;
+        itc_allocation: GstInput['itc_allocation'] | null;
         counterparty_gstin: string | null;
         supply_state: string;
         amounts: GstCalculation;
@@ -2678,6 +2813,11 @@ function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) =
                   'CGST minor',
                   'SGST / UTGST minor',
                   'IGST minor',
+                  'Recoverable CGST minor',
+                  'Recoverable SGST / UTGST minor',
+                  'Recoverable IGST minor',
+                  'ITC return treatment',
+                  'ITC review basis',
                 ],
                 ...report.rows.flatMap((r) =>
                   r.amounts.lines.map((l, index) => [
@@ -2697,6 +2837,23 @@ function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) =
                     (BigInt(l.cgst_minor) * BigInt(r.sign)).toString(),
                     (BigInt(l.sgst_minor) * BigInt(r.sign)).toString(),
                     (BigInt(l.igst_minor) * BigInt(r.sign)).toString(),
+                    ['purchase', 'debit_note'].includes(r.kind)
+                      ? (
+                          BigInt(l.input_credit?.cgst_minor ?? l.cgst_minor) * BigInt(r.sign)
+                        ).toString()
+                      : '',
+                    ['purchase', 'debit_note'].includes(r.kind)
+                      ? (
+                          BigInt(l.input_credit?.sgst_minor ?? l.sgst_minor) * BigInt(r.sign)
+                        ).toString()
+                      : '',
+                    ['purchase', 'debit_note'].includes(r.kind)
+                      ? (
+                          BigInt(l.input_credit?.igst_minor ?? l.igst_minor) * BigInt(r.sign)
+                        ).toString()
+                      : '',
+                    r.itc_allocation?.return_treatment || '',
+                    r.itc_allocation?.reason || '',
                   ]),
                 ),
               ]),
@@ -2721,7 +2878,7 @@ function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) =
           <tbody>
             {Object.entries(report.totals).map(([kind, r]) => (
               <tr key={kind}>
-                <td>{kind === 'sale' ? 'Outward supplies' : 'Reviewed inward ITC'}</td>
+                <td>{kind === 'sale' ? 'Outward supplies' : 'Inward value / recoverable tax'}</td>
                 <td>{money(r.taxable_minor, 'INR')}</td>
                 <td>{money(r.cgst_minor, 'INR')}</td>
                 <td>{money(r.sgst_minor, 'INR')}</td>

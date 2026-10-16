@@ -111,6 +111,23 @@ pub struct InwardNoTax {
     pub intra_state_minor: String,
 }
 #[derive(Debug, Serialize)]
+pub struct InputTaxReview {
+    pub document_id: i64,
+    pub number: String,
+    pub date: String,
+    pub event: String,
+    pub sign: i32,
+    pub original_invoice: Option<String>,
+    pub supplier_gstin: Option<String>,
+    pub supplier_reference: Option<String>,
+    pub allocation: Option<crate::ItcAllocation>,
+    pub invoice_tax: ReturnAmounts,
+    pub recoverable_tax: ReturnAmounts,
+    pub nonrecoverable_tax: ReturnAmounts,
+    pub lines: Vec<crate::GstLine>,
+    pub original_line_indices: Vec<usize>,
+}
+#[derive(Debug, Serialize)]
 pub struct GstReturnDraft {
     pub format: &'static str,
     pub version: u32,
@@ -127,7 +144,11 @@ pub struct GstReturnDraft {
     pub gstr3b_book_3_1_a: ReturnAmounts,
     pub gstr3b_book_3_1_c: ReturnAmounts,
     pub gstr3b_book_3_1_e: ReturnAmounts,
-    pub gstr3b_book_4_a_5: ReturnAmounts,
+    pub gstr3b_draft_4_a_5: ReturnAmounts,
+    pub gstr3b_draft_4_b_1: ReturnAmounts,
+    pub gstr3b_draft_4_d_2: ReturnAmounts,
+    pub book_recoverable_input_tax: ReturnAmounts,
+    pub input_tax_rows: Vec<InputTaxReview>,
     pub gstr3b_book_5: Vec<InwardNoTax>,
     pub gstr3b_book_3_2_unregistered: BTreeMap<String, ReturnAmounts>,
     pub reconciliation: Vec<GstReconciliation>,
@@ -169,7 +190,7 @@ fn csv(rows: &[Vec<String>]) -> String {
             r.iter()
                 .map(|s| {
                     // Spreadsheet formula protection without altering numeric amounts.
-                    let unsafe_text = s.starts_with(['=', '+', '@', '-'])
+                    let unsafe_text = s.trim_start().starts_with(['=', '+', '@', '-'])
                         && s.parse::<i128>().is_err()
                         && !s
                             .strip_prefix('-')
@@ -310,7 +331,7 @@ impl LedgerStore {
             .collect::<BTreeMap<_, _>>();
         let mut out = GstReturnDraft {
             format: "open-ledger-gst-return-draft",
-            version: 1,
+            version: 2,
             query,
             from: from.clone(),
             to: to.clone(),
@@ -324,7 +345,11 @@ impl LedgerStore {
             gstr3b_book_3_1_a: amounts([0; 4]),
             gstr3b_book_3_1_c: amounts([0; 4]),
             gstr3b_book_3_1_e: amounts([0; 4]),
-            gstr3b_book_4_a_5: amounts([0; 4]),
+            gstr3b_draft_4_a_5: amounts([0; 4]),
+            gstr3b_draft_4_b_1: amounts([0; 4]),
+            gstr3b_draft_4_d_2: amounts([0; 4]),
+            book_recoverable_input_tax: amounts([0; 4]),
+            input_tax_rows: vec![],
             gstr3b_book_5: vec![],
             gstr3b_book_3_2_unregistered: BTreeMap::new(),
             reconciliation: vec![],
@@ -354,6 +379,7 @@ impl LedgerStore {
         let mut exempt = BTreeMap::<String, [i128; 3]>::new();
         let mut no_tax_book = [0i128; 3];
         let mut no_tax_inward = [[0i128; 2]; 2];
+        let mut mapped_itc = [[0i128; 4]; 3];
         for (d, reversed) in &docs {
             let in_period = d.input.date >= from && d.input.date <= to;
             let reversal_in_period = reversed
@@ -372,6 +398,107 @@ impl LedgerStore {
                 out.issues.push(issue("unclassified_document", d, "No GST classification is recorded. Determine exempt, nil-rated, non-GST or taxable treatment before completing the return."));
                 continue;
             };
+            if !outward && g.classification.is_none() {
+                let credit = calc.credit_values()?;
+                let full = values(calc)?;
+                let recoverable = [
+                    0,
+                    i128::from(credit[0]),
+                    i128::from(credit[1]),
+                    i128::from(credit[2]),
+                ];
+                for (included, date, sign, event) in [
+                    (
+                        in_period,
+                        d.input.date.as_str(),
+                        if d.correction.is_some() { -1 } else { 1 },
+                        if d.correction.is_some() {
+                            "return_note"
+                        } else {
+                            "invoice"
+                        },
+                    ),
+                    (
+                        reversal_in_period,
+                        reversed.as_deref().unwrap_or(""),
+                        -1,
+                        "accounting_reversal",
+                    ),
+                ] {
+                    if included {
+                        out.input_tax_rows.push(InputTaxReview {
+                            document_id: d.id,
+                            number: d.number.clone(),
+                            date: date.into(),
+                            event: event.into(),
+                            sign: sign as i32,
+                            original_invoice: d
+                                .correction
+                                .as_ref()
+                                .map(|_| original.number.clone()),
+                            supplier_gstin: g.counterparty_gstin.clone(),
+                            supplier_reference: g.supplier_reference.clone(),
+                            allocation: g.itc_allocation.clone(),
+                            invoice_tax: amounts(full.map(|n| n * sign)),
+                            recoverable_tax: amounts(recoverable.map(|n| n * sign)),
+                            nonrecoverable_tax: amounts([
+                                0,
+                                (full[1] - recoverable[1]) * sign,
+                                (full[2] - recoverable[2]) * sign,
+                                (full[3] - recoverable[3]) * sign,
+                            ]),
+                            lines: calc.lines.clone(),
+                            original_line_indices: d
+                                .correction
+                                .as_ref()
+                                .map(|c| c.lines.iter().map(|l| l.original_line).collect())
+                                .unwrap_or_else(|| (0..calc.lines.len()).collect()),
+                        });
+                    }
+                }
+                let treatment = g
+                    .itc_allocation
+                    .as_ref()
+                    .and_then(|a| a.return_treatment.as_deref());
+                let mapped = full[1..] == recoverable[1..]
+                    || g.itc_allocation.is_none()
+                    || (treatment.is_some() && from.as_str() >= "2022-09-01");
+                if mapped {
+                    for (included, sign) in [
+                        (in_period, if d.correction.is_some() { -1 } else { 1 }),
+                        (reversal_in_period, -1),
+                    ] {
+                        if !included {
+                            continue;
+                        }
+                        let gross = if treatment == Some("permanent_reversal") {
+                            [0, full[1], full[2], full[3]]
+                        } else {
+                            recoverable
+                        };
+                        add(&mut mapped_itc[0], gross, sign);
+                        if let Some(treatment) = treatment {
+                            let excluded = [
+                                0,
+                                full[1] - recoverable[1],
+                                full[2] - recoverable[2],
+                                full[3] - recoverable[3],
+                            ];
+                            add(
+                                &mut mapped_itc[if treatment == "permanent_reversal" {
+                                    1
+                                } else {
+                                    2
+                                }],
+                                excluded,
+                                sign,
+                            );
+                        }
+                    }
+                } else {
+                    out.issues.push(issue("unmapped_itc_return_treatment",d,"This purchase's recoverable book tax is reconciled, but its gross/reversal/ineligible return treatment is not mapped for this period. Review table 4 and GSTR-2B/IMS separately."));
+                }
+            }
             if !outward && let Some(class) = &g.classification {
                 let index = usize::from(class.kind == "non_gst");
                 let locality = usize::from(class.supplier_state.as_ref() == Some(&p.state_code));
@@ -651,6 +778,9 @@ impl LedgerStore {
                 intra_state_minor: n[1].to_string(),
             })
             .collect();
+        out.gstr3b_draft_4_a_5 = amounts(mapped_itc[0]);
+        out.gstr3b_draft_4_b_1 = amounts(mapped_itc[1]);
+        out.gstr3b_draft_4_d_2 = amounts(mapped_itc[2]);
         out.gstr3b_book_3_1_c = amounts([no_tax_book[0] + no_tax_book[1], 0, 0, 0]);
         out.gstr3b_book_3_1_e = amounts([no_tax_book[2], 0, 0, 0]);
         out.gstr1_sections = sections.into_iter().map(|(s, n)| (s, amounts(n))).collect();
@@ -689,7 +819,7 @@ impl LedgerStore {
                 regular[0] -= no_tax_book.iter().sum::<i128>();
                 out.gstr3b_book_3_1_a = amounts(regular);
             } else {
-                out.gstr3b_book_4_a_5 = amounts(expected);
+                out.book_recoverable_input_tax = amounts(expected);
             }
             for (i, (component, id)) in [
                 ("CGST", accounts.cgst),
@@ -798,9 +928,27 @@ impl LedgerStore {
         )))
         .chain(std::iter::once((
             "4(A)(5)",
-            "Book reviewed input credit; reconcile GSTR-2B/IMS",
+            "Draft other ITC after reviewed gross/exclusion mapping; reconcile GSTR-2B/IMS",
             "",
-            &out.gstr3b_book_4_a_5,
+            &out.gstr3b_draft_4_a_5,
+        )))
+        .chain(std::iter::once((
+            "4(B)(1)",
+            "Draft reviewed permanent reversals",
+            "",
+            &out.gstr3b_draft_4_b_1,
+        )))
+        .chain(std::iter::once((
+            "4(D)(2)",
+            "Draft reviewed excluded ineligible tax",
+            "",
+            &out.gstr3b_draft_4_d_2,
+        )))
+        .chain(std::iter::once((
+            "Book ITC",
+            "Recoverable input tax in books",
+            "",
+            &out.book_recoverable_input_tax,
         )))
         .chain(out.gstr3b_book_3_2_unregistered.iter().map(|(pos, n)| {
             (
@@ -819,7 +967,7 @@ impl LedgerStore {
                 table.into(),
                 description.into(),
                 pos.into(),
-                if table == "4(A)(5)" {
+                if table.starts_with('4') || table == "Book ITC" {
                     "".into()
                 } else {
                     parse(&n.taxable_minor)?

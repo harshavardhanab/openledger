@@ -145,7 +145,7 @@ fn return_schema_rebuild_rolls_back_atomically_and_preserves_child_references() 
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        5
+        6
     );
     let fk: String = conn
         .query_row(
