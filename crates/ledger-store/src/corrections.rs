@@ -151,6 +151,7 @@ pub(crate) fn prepare_correction(
             "Returns must follow the original invoice and its latest settlement, return or reversal; reversed invoices cannot be returned.",
         ));
     }
+    crate::itc::check_return(tx, invoice, &d.date, before)?;
     let tax_review = orig
         .input
         .gst

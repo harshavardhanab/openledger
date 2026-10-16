@@ -149,6 +149,8 @@ pub struct BankLine {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct BusinessBackup {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub itc_adjustments: Vec<crate::ItcAdjustment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gst: Option<crate::GstProfile>,
     pub parties: Vec<Party>,
@@ -161,7 +163,8 @@ pub struct BusinessBackup {
 }
 impl BusinessBackup {
     pub(crate) fn is_empty(&self) -> bool {
-        self.gst.is_none()
+        self.itc_adjustments.is_empty()
+            && self.gst.is_none()
             && self.parties.is_empty()
             && self.items.is_empty()
             && self.documents.is_empty()
@@ -318,6 +321,11 @@ fn signed_amount(s: &str) -> Result<i128> {
 }
 pub(crate) fn check_stock_accounts(tx: &Transaction<'_>, p: &ValidatedJournal) -> Result<()> {
     for l in &p.lines {
+        if crate::itc::pending_account(tx, l.account_id)? {
+            return Err(invalid(
+                "Use linked ITC adjustments for a pending ITC account.",
+            ));
+        }
         let n: i64 = tx.query_row(
             "SELECT COUNT(*) FROM items WHERE asset_account_id=?1",
             [l.account_id],
@@ -884,6 +892,12 @@ impl LedgerStore {
         Ok(())
     }
     pub(crate) fn check_business_reversal(&self, id: i64) -> Result<()> {
+        let linked: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM itc_adjustments a JOIN documents d ON d.id=a.invoice_id WHERE a.journal_id=?1 OR d.journal_id=?1)", [id], |r| r.get(0))?;
+        if linked {
+            return Err(invalid(
+                "Linked ITC adjustments and their purchase cannot be reversed independently. Use reviewed temporary reversals or linked reclaims.",
+            ));
+        }
         let notes:i64=self.conn.query_row("SELECT COUNT(*) FROM documents WHERE (journal_id=?1 AND kind IN ('credit_note','debit_note')) OR (invoice_id IN (SELECT id FROM documents WHERE journal_id=?1) AND kind IN ('credit_note','debit_note'))",[id],|r|r.get(0))?;
         if notes > 0 {
             return Err(invalid(
@@ -1024,6 +1038,7 @@ impl LedgerStore {
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
+        result.itc_adjustments = crate::itc::records(&self.conn)?;
         Ok(result)
     }
     pub fn business_state(
@@ -1556,6 +1571,7 @@ impl LedgerStore {
             return Err(invalid("An inventory posting has no stock document."));
         }
         tx.commit()?;
+        self.restore_itc(b.itc_adjustments)?;
         // Replay closing calculations independently, using balances immediately before each closing journal.
         for p in b.periods {
             validate_date(&p.start)?;
@@ -1651,7 +1667,7 @@ impl LedgerStore {
         for r in b.reconciliations {
             save_reconciliation(&tx, Some(r.id), &r.input)?;
         }
-        let missing:i64=tx.query_row("SELECT COUNT(*) FROM journals j WHERE (j.source='document' AND NOT EXISTS(SELECT 1 FROM documents d WHERE d.journal_id=j.id)) OR (j.source='close' AND NOT EXISTS(SELECT 1 FROM periods p WHERE p.journal_id=j.id))",[],|r|r.get(0))?;
+        let missing:i64=tx.query_row("SELECT COUNT(*) FROM journals j WHERE (j.source='document' AND NOT EXISTS(SELECT 1 FROM documents d WHERE d.journal_id=j.id) AND NOT EXISTS(SELECT 1 FROM itc_adjustments a WHERE a.journal_id=j.id)) OR (j.source='close' AND NOT EXISTS(SELECT 1 FROM periods p WHERE p.journal_id=j.id))",[],|r|r.get(0))?;
         if missing > 0 {
             return Err(invalid("A business journal is missing its source record."));
         }

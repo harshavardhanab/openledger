@@ -860,9 +860,168 @@ test('blocked and apportioned purchase ITC increases cost and returns reverse on
   ).toEqual([]);
   expect(input.reconciled).toBe(true);
   const backup = await api(request, 'backup');
-  expect(JSON.parse(backup).version).toBe(6);
+  expect(JSON.parse(backup).version).toBe(7);
   await api(request, 'restore_backup', { contents: backup });
   expect(
     (await api(request, 'ledger', { account_id: 8, from: null, to: null })).closing_minor,
   ).toBe('172500');
+});
+
+test('temporary ITC reversals and partial linked reclaims preserve books and draft source links', async ({
+  page,
+  request,
+}) => {
+  await company(page, request, 'Temporary ITC UI');
+  const controls = await api(request, 'gst_control_accounts');
+  await api(request, 'configure_gst', {
+    gstin: '29ABCDE1234F1Z5',
+    state_code: '29',
+    state_name: 'Karnataka',
+    address: 'Synthetic office',
+    ...controls,
+  });
+  const supplier = await api(request, 'create_party', {
+    name: 'Deferred supplier',
+    kind: 'supplier',
+    contact: '',
+    account_id: 5,
+  });
+  const pending = await api(request, 'create_account', {
+    code: '1490',
+    name: 'Pending ITC evidence',
+    kind: 'asset',
+  });
+  const bill = await api(request, 'post_document', {
+    kind: 'purchase',
+    date: '2026-10-01',
+    due_date: '2026-10-14',
+    party_id: supplier.id,
+    invoice_id: null,
+    money_account_id: null,
+    amount: null,
+    note: 'Synthetic purchase',
+    lines: [
+      { description: 'Service', quantity: '1', unit_price: '1000', account_id: 8, item_id: null },
+    ],
+    request_id: 'pending-purchase',
+    gst: {
+      supply_state: '29',
+      supply_state_name: 'Karnataka',
+      counterparty_gstin: '29ABCDE1234F1Z5',
+      counterparty_address: 'Synthetic supplier',
+      delivery_address: 'Synthetic recipient',
+      supplier_reference: 'PEND-1',
+      credit_reviewed: true,
+      rates_bps: [1800],
+      hsn_sac: ['998314'],
+    },
+  });
+  await page.reload();
+  await nav(page, 'Invoices & settlements');
+  await page.getByRole('button', { name: bill.number, exact: true }).click();
+  const region = page.getByRole('region', {
+    name: 'Temporary ITC reversals & reclaims',
+    exact: true,
+  });
+  await region
+    .getByLabel('Pending ITC asset account', { exact: true })
+    .selectOption(String(pending.id));
+  await region.getByLabel('ITC effective date').fill('2026-10-02');
+  await region.getByLabel('CGST adjustment amount', { exact: true }).fill('30');
+  await region.getByLabel('SGST / UTGST adjustment amount', { exact: true }).fill('20');
+  await region
+    .getByLabel('ITC review basis', { exact: true })
+    .fill('Reviewed temporary reversal awaiting evidence');
+  await region.getByRole('checkbox').check();
+  await region.getByRole('button', { name: 'Preview ITC posting', exact: true }).click();
+  await expect(
+    region.getByRole('heading', { name: 'Review ITC posting', exact: true }),
+  ).toBeVisible();
+  expect(
+    (await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa']).analyze())
+      .violations,
+  ).toEqual([]);
+  await region.getByRole('button', { name: 'Post reviewed ITC adjustment', exact: true }).click();
+  await expect(
+    region.getByRole('heading', { name: 'Linked ITC history (1)', exact: true }),
+  ).toBeVisible();
+  await region.getByLabel('ITC adjustment', { exact: true }).selectOption('1');
+  await region.getByLabel('ITC effective date').fill('2026-11-01');
+  await region.getByLabel('CGST adjustment amount', { exact: true }).fill('10');
+  await region.getByLabel('SGST / UTGST adjustment amount', { exact: true }).fill('5');
+  await region
+    .getByLabel('ITC review basis', { exact: true })
+    .fill('Reviewed partial reclaim with supporting evidence');
+  await region.getByRole('checkbox').check();
+  await region.getByRole('button', { name: 'Preview ITC posting', exact: true }).click();
+  await region.getByRole('button', { name: 'Post reviewed ITC adjustment', exact: true }).click();
+  await expect(
+    region.getByRole('heading', { name: 'Linked ITC history (2)', exact: true }),
+  ).toBeVisible();
+  const downloading = page.waitForEvent('download');
+  await region.getByRole('button', { name: 'Export ITC history', exact: true }).click();
+  const file = await downloading;
+  const history = JSON.parse(readFileSync((await file.path())!, 'utf8'));
+  expect(history.adjustments[0].remaining.cgst_minor).toBe('2000');
+  expect(history.adjustments[1].input.deferral_id).toBe(1);
+  await nav(page, 'Financial statements');
+  await page.getByLabel('GST return month / quarter end').fill('2026-10');
+  await page.getByRole('button', { name: 'Prepare GST return draft', exact: true }).click();
+  const exporting = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export complete GST draft (JSON)', exact: true }).click();
+  const draftFile = await exporting;
+  const draft = JSON.parse(readFileSync((await draftFile.path())!, 'utf8'));
+  expect(draft.version).toBe(3);
+  expect(draft.gstr3b_draft_4_b_2.cgst_minor).toBe('3000');
+  expect(draft.gstr3b_draft_4_c.cgst_minor).toBe('6000');
+  expect(draft.reconciled).toBe(true);
+  expect(draft.issues).toEqual([]);
+  const backup = await api(request, 'backup');
+  expect(JSON.parse(backup).version).toBe(7);
+  await api(request, 'restore_backup', { contents: backup });
+  expect(
+    (await api(request, 'itc_adjustments', { invoice_id: bill.id }))[0].remaining.sgst_minor,
+  ).toBe('1500');
+  const register = await api(request, 'gst_report', { from: '2026-10-01', to: '2026-11-30' });
+  expect(register.totals.purchase.cgst_minor).toBe('7000');
+  expect(register.itc_adjustments).toHaveLength(2);
+  await page.reload();
+  await nav(page, 'Invoices & settlements');
+  await page.getByRole('button', { name: 'New purchase invoice', exact: true }).click();
+  await page.getByLabel('Supplier', { exact: true }).selectOption({ label: 'Deferred supplier' });
+  await page.getByLabel('Date', { exact: true }).fill('2026-10-03');
+  await page.getByLabel('Description', { exact: true }).fill('Initially held service');
+  await page.getByLabel('Unit price', { exact: true }).fill('1000');
+  await page.getByLabel('Posting account').selectOption('8');
+  await page.getByRole('checkbox', { name: 'Record India tax details', exact: true }).check();
+  await page.getByLabel('Supplier GSTIN', { exact: true }).fill('29ABCDE1234F1Z5');
+  await page.getByLabel('Supplier tax invoice reference').fill('PEND-2');
+  await page.getByLabel('Counterparty postal address').fill('Synthetic supplier');
+  await page.getByLabel('Delivery address').fill('Synthetic recipient');
+  await page.getByLabel('Reviewed GST rate (%)', { exact: true }).fill('18');
+  await page.getByLabel('HSN / SAC', { exact: true }).fill('998314');
+  await page
+    .getByRole('checkbox', { name: 'I independently reviewed input tax credit eligibility.' })
+    .check();
+  await page
+    .getByRole('checkbox', { name: 'Hold reviewed recoverable ITC pending', exact: true })
+    .check();
+  await page.getByLabel('Initial pending ITC asset account').selectOption(String(pending.id));
+  await page
+    .getByLabel('Initial ITC deferral basis')
+    .fill('Reviewed potential recovery pending conditions');
+  await page.getByRole('button', { name: 'Review document', exact: true }).click();
+  await expect(
+    page.getByRole('heading', { name: 'Pending ITC posting', exact: true }),
+  ).toBeVisible();
+  await page.getByRole('button', { name: 'Post purchase invoice', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'BILL-000002', exact: true })).toBeVisible();
+  expect(
+    (await api(request, 'ledger', { account_id: controls.input.cgst, from: null, to: null }))
+      .closing_minor,
+  ).toBe('7000');
+  expect(
+    (await api(request, 'ledger', { account_id: pending.id, from: null, to: null })).closing_minor,
+  ).toBe('21500');
+  expect((await api(request, 'state')).journal_count).toBe(5);
 });

@@ -23,6 +23,21 @@ type Draft = {
   gstr3b_book_3_1_e: Amounts;
   gstr3b_draft_4_a_5: Amounts;
   gstr3b_draft_4_b_1: Amounts;
+  gstr3b_draft_4_b_2: Amounts;
+  gstr3b_draft_4_d_1: Amounts;
+  gstr3b_draft_4_c: Amounts;
+  itc_adjustments: {
+    id: number;
+    input: {
+      date: string;
+      invoice_id: number;
+      deferral_id: number | null;
+      reason: string;
+      cgst: string;
+      sgst: string;
+      igst: string;
+    };
+  }[];
   gstr3b_draft_4_d_2: Amounts;
   book_recoverable_input_tax: Amounts;
   input_tax_rows: {
@@ -145,6 +160,13 @@ export function GstReturns({ state }: { state: Snapshot }) {
               ...a,
             }))}
           />
+          {draft.itc_adjustments.length > 0 && (
+            <p>
+              {draft.itc_adjustments.length} linked temporary ITC reversal/reclaim events are
+              included in this draft. Review their full source details in the complete JSON and
+              purchase details.
+            </p>
+          )}
           <h4>GSTR-3B book worksheet</h4>
           <AmountTable
             rows={[
@@ -159,6 +181,21 @@ export function GstReturns({ state }: { state: Snapshot }) {
               {
                 label: '4(B)(1) · Draft reviewed permanent reversals',
                 ...draft.gstr3b_draft_4_b_1,
+                taxable_minor: '',
+              },
+              {
+                label: '4(B)(2) · Draft reviewed temporary reversals',
+                ...draft.gstr3b_draft_4_b_2,
+                taxable_minor: '',
+              },
+              {
+                label: '4(D)(1) · Draft linked reclaims included in 4(A)(5)',
+                ...draft.gstr3b_draft_4_d_1,
+                taxable_minor: '',
+              },
+              {
+                label: '4(C) · Draft net mapped ITC',
+                ...draft.gstr3b_draft_4_c,
                 taxable_minor: '',
               },
               {

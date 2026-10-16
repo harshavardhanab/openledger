@@ -785,6 +785,7 @@ fn v4_backup_and_database_migration_preserve_regular_gst_retry_identity() {
     disk.restore(&old.to_string()).unwrap();
     drop(disk);
     let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE itc_adjustments").unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
     let migrated = LedgerStore::open(&path).unwrap();
@@ -797,7 +798,7 @@ fn v4_backup_and_database_migration_preserve_regular_gst_retry_identity() {
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
 }
 
@@ -1120,4 +1121,360 @@ fn itc_draft_separates_excluded_tax_from_unmapped_book_credit_and_keeps_reconcil
             .iter()
             .any(|i| i["code"] == "unmapped_itc_return_treatment")
     );
+}
+
+fn adjustment(invoice: i64, account: i64, key: &str) -> ItcAdjustmentInput {
+    ItcAdjustmentInput {
+        invoice_id: invoice,
+        deferral_id: None,
+        pending_account_id: account,
+        date: "2026-10-02".into(),
+        cgst: "30".into(),
+        sgst: "20".into(),
+        igst: "0".into(),
+        reason: "Synthetic reviewed temporary ITC reversal, not an eligibility determination"
+            .into(),
+        eligibility_reviewed: true,
+        request_id: key.into(),
+    }
+}
+#[test]
+fn temporary_itc_is_linked_bounded_and_reported_on_effective_dates() {
+    let (mut s, p, _, v) = books();
+    let d = s
+        .post_document(invoice("purchase", v.id, "deferred-purchase", "29"))
+        .unwrap();
+    let account = s
+        .create_account(AccountInput {
+            code: "1490".into(),
+            name: "Pending ITC review".into(),
+            kind: ledger_core::AccountKind::Asset,
+        })
+        .unwrap()
+        .id;
+    let input = adjustment(d.id, account, "defer-one");
+    let preview = s.preview_itc_adjustment(input.clone()).unwrap();
+    assert_eq!(preview.total_minor, 5000);
+    let a = s.post_itc_adjustment(input.clone()).unwrap();
+    assert_eq!(s.post_itc_adjustment(input.clone()).unwrap().id, a.id);
+    assert_eq!(s.ledger(account, None, None).unwrap().closing_minor, "5000");
+    assert_eq!(
+        s.ledger(p.input.cgst, None, None).unwrap().closing_minor,
+        "6000"
+    );
+    assert_eq!(s.ledger(5, None, None).unwrap().closing_minor, "-118000");
+    assert_eq!(
+        s.financial_statements(None, None).unwrap().expense_minor,
+        "100000"
+    );
+    let mut claim = input.clone();
+    claim.request_id = "claim-part".into();
+    claim.deferral_id = Some(a.id);
+    claim.date = "2026-11-01".into();
+    claim.cgst = "10".into();
+    claim.sgst = "5".into();
+    s.post_itc_adjustment(claim.clone()).unwrap();
+    let remaining = &s.itc_adjustments(d.id).unwrap()[0].remaining;
+    assert_eq!(remaining.cgst_minor, "2000");
+    assert_eq!(remaining.sgst_minor, "1500");
+    let draft = s
+        .gst_return_draft(GstReturnQuery {
+            period: "2026-10".into(),
+            frequency: "monthly".into(),
+        })
+        .unwrap();
+    assert_eq!(draft.gstr3b_draft_4_b_2.cgst_minor, "3000");
+    assert_eq!(draft.gstr3b_draft_4_c.cgst_minor, "6000");
+    assert_eq!(draft.book_recoverable_input_tax.cgst_minor, "6000");
+    assert!(draft.reconciled);
+    assert!(
+        !draft
+            .issues
+            .iter()
+            .any(|i| i.code.starts_with("manual_gst"))
+    );
+    let next = s
+        .gst_return_draft(GstReturnQuery {
+            period: "2026-11".into(),
+            frequency: "monthly".into(),
+        })
+        .unwrap();
+    assert_eq!(next.gstr3b_draft_4_a_5.cgst_minor, "1000");
+    assert_eq!(next.gstr3b_draft_4_d_1.cgst_minor, "1000");
+    assert_eq!(next.gstr3b_draft_4_c.sgst_minor, "500");
+    assert!(next.reconciled);
+    let backup = s.export_backup().unwrap();
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&backup).unwrap();
+    assert_eq!(restored.post_itc_adjustment(input).unwrap(), a);
+    assert_eq!(
+        restored.post_itc_adjustment(claim.clone()).unwrap().input,
+        claim
+    );
+    let original: Value = serde_json::from_str(&backup).unwrap();
+    for tamper in ["amount", "link", "journal", "missing", "version", "reason"] {
+        let mut b = original.clone();
+        match tamper {
+            "amount" => b["business"]["itc_adjustments"][0]["input"]["cgst"] = json!("31"),
+            "link" => b["business"]["itc_adjustments"][1]["input"]["deferral_id"] = json!(999),
+            "journal" => b["business"]["itc_adjustments"][0]["journal_id"] = json!(d.journal_id),
+            "missing" => b["business"]["itc_adjustments"] = json!([]),
+            "version" => b["version"] = json!(6),
+            _ => b["business"]["itc_adjustments"][0]["input"]["reason"] = json!("Changed basis"),
+        }
+        assert!(
+            LedgerStore::prepare_restore(&b.to_string()).is_err(),
+            "{tamper}"
+        );
+    }
+    let count = s.snapshot().unwrap().journal_count;
+    for change in [
+        "overclaim",
+        "wrong-source",
+        "wrong-account",
+        "unreviewed",
+        "backdate",
+        "retry",
+    ] {
+        let mut bad = claim.clone();
+        bad.request_id = format!("bad-{change}");
+        match change {
+            "overclaim" => bad.cgst = "20.01".into(),
+            "wrong-source" => bad.deferral_id = Some(999),
+            "wrong-account" => bad.pending_account_id = 4,
+            "unreviewed" => bad.eligibility_reviewed = false,
+            "backdate" => bad.date = "2026-10-31".into(),
+            _ => {
+                bad.request_id = "claim-part".into();
+                bad.reason = "Different retry".into();
+            }
+        }
+        assert!(s.post_itc_adjustment(bad).is_err(), "{change}");
+    }
+    assert_eq!(s.snapshot().unwrap().journal_count, count);
+    assert!(
+        s.reverse(a.journal_id, "2026-11-02", "Cannot detach", "rev-itc")
+            .is_err()
+    );
+    assert!(
+        s.reverse(d.journal_id, "2026-11-02", "Cannot detach", "rev-invoice")
+            .is_err()
+    );
+    let mut note: DocumentInput=serde_json::from_value(json!({"kind":"debit_note","date":"2026-11-02","party_id":v.id,"invoice_id":d.id,"due_date":null,"money_account_id":null,"amount":null,"note":"Reviewed supplier return","lines":[],"return_lines":[{"line":0,"quantity":"1"}],"gst_adjustment_reviewed":true,"request_id":"after-itc-return"})).unwrap();
+    assert!(s.post_document(note.clone()).is_err());
+    claim.request_id = "claim-rest".into();
+    claim.cgst = "20".into();
+    claim.sgst = "15".into();
+    claim.date = "2026-11-02".into();
+    s.post_itc_adjustment(claim).unwrap();
+    note.date = "2026-11-03".into();
+    s.post_document(note).unwrap();
+    assert_eq!(s.ledger(account, None, None).unwrap().closing_minor, "0");
+    assert_eq!(
+        s.ledger(p.input.cgst, None, None).unwrap().closing_minor,
+        "0"
+    );
+    let mut later = adjustment(d.id, account, "after-return");
+    later.date = "2026-11-04".into();
+    assert!(s.post_itc_adjustment(later).is_err());
+    restored.restore(&s.export_backup().unwrap()).unwrap();
+    assert_eq!(
+        restored.ledger(account, None, None).unwrap().closing_minor,
+        "0"
+    );
+}
+
+#[test]
+fn deferred_itc_accounts_and_periods_cannot_bypass_accounting_guards() {
+    let (mut s, p, _, v) = books();
+    let mut purchase = invoice("purchase", v.id, "guarded-purchase", "29");
+    purchase.gst.as_mut().unwrap().itc_allocation = Some(ItcAllocation {
+        eligible_bps: vec![5000],
+        return_treatment: Some("permanent_reversal".into()),
+        reason: "Reviewed half recoverable".into(),
+    });
+    let bill = s.post_document(purchase).unwrap();
+    let account = s
+        .create_account(AccountInput {
+            code: "1490".into(),
+            name: "Dedicated pending".into(),
+            kind: ledger_core::AccountKind::Asset,
+        })
+        .unwrap()
+        .id;
+    let mut input = adjustment(bill.id, account, "guarded-deferral");
+    for (component, value) in [("cgst", "45.01"), ("igst", "0.01"), ("sgst", "-1")] {
+        let mut bad = input.clone();
+        bad.request_id = format!("bad-{component}");
+        match component {
+            "cgst" => bad.cgst = value.into(),
+            "igst" => bad.igst = value.into(),
+            _ => bad.sgst = value.into(),
+        };
+        assert!(s.post_itc_adjustment(bad).is_err());
+    }
+    input.pending_account_id = p.input.cgst;
+    assert!(s.post_itc_adjustment(input.clone()).is_err());
+    input.pending_account_id = account;
+    let a = s.post_itc_adjustment(input.clone()).unwrap();
+    assert!(
+        s.create_party(PartyInput {
+            name: "Invalid pending party".into(),
+            kind: "customer".into(),
+            contact: "".into(),
+            account_id: account
+        })
+        .is_err()
+    );
+    assert!(
+        s.create_item(ItemInput {
+            code: "BAD".into(),
+            name: "Invalid pending stock".into(),
+            unit: "each".into(),
+            asset_account_id: account,
+            expense_account_id: 8
+        })
+        .is_err()
+    );
+    assert!(
+        s.post(ledger_core::JournalInput {
+            date: "2026-10-03".into(),
+            reference: "".into(),
+            description: "Unlinked pending movement".into(),
+            request_id: "bad-manual-pending".into(),
+            lines: vec![
+                ledger_core::PostingInput {
+                    account_id: account,
+                    side: ledger_core::Side::Debit,
+                    amount: "1".into()
+                },
+                ledger_core::PostingInput {
+                    account_id: 6,
+                    side: ledger_core::Side::Credit,
+                    amount: "1".into()
+                }
+            ]
+        })
+        .is_err()
+    );
+    s.close_period("2026-04-01", "2026-10-31", 6).unwrap();
+    let mut claim = input.clone();
+    claim.deferral_id = Some(a.id);
+    claim.request_id = "closed-claim".into();
+    assert!(s.post_itc_adjustment(claim.clone()).is_err());
+    claim.date = "2026-11-01".into();
+    s.post_itc_adjustment(claim).unwrap();
+    assert_eq!(s.ledger(account, None, None).unwrap().closing_minor, "0");
+    LedgerStore::prepare_restore(&s.export_backup().unwrap()).unwrap();
+    let mut forged: Value = serde_json::from_str(&s.export_backup().unwrap()).unwrap();
+    forged["journals"].as_array_mut().unwrap().push(json!({"id":999,"source":"manual","date":"2026-11-02","reference":"","description":"Unlinked pending movement","request_id":"forged-pending","created_at":"2026-11-02T00:00:00Z","reversal_of":null,"lines":[{"account_id":account,"side":"debit","amount_minor":"100"},{"account_id":6,"side":"credit","amount_minor":"100"}]}));
+    assert!(LedgerStore::prepare_restore(&forged.to_string()).is_err());
+}
+
+#[test]
+fn temporary_itc_preview_preserves_amounts_above_javascript_safe_integer() {
+    let (mut s, _, _, v) = books();
+    let mut input = invoice("purchase", v.id, "large-itc-purchase", "29");
+    input.lines[0].unit_price = "2000000000000000".into();
+    let bill = s.post_document(input).unwrap();
+    let account = s
+        .create_account(AccountInput {
+            code: "1490".into(),
+            name: "Large pending".into(),
+            kind: ledger_core::AccountKind::Asset,
+        })
+        .unwrap()
+        .id;
+    let mut input = adjustment(bill.id, account, "large-itc-deferral");
+    input.cgst = "90071992547409.93".into();
+    input.sgst = "0".into();
+    let preview = s.preview_itc_adjustment(input.clone()).unwrap();
+    assert_eq!(preview.lines[0].amount_minor, 9007199254740993);
+    s.post_itc_adjustment(input.clone()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.sqlite");
+    let service = LedgerService::open(&path).unwrap();
+    service
+        .request(
+            "restore_backup",
+            json!({"contents":s.export_backup().unwrap()}),
+        )
+        .unwrap();
+    input.deferral_id = Some(1);
+    input.request_id = "large-itc-reclaim".into();
+    input.date = "2026-10-03".into();
+    let preview = service
+        .request(
+            "preview_itc_adjustment",
+            serde_json::to_value(&input).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(preview["lines"][0]["amount_minor"], "9007199254740993");
+    service
+        .request("post_itc_adjustment", serde_json::to_value(&input).unwrap())
+        .unwrap();
+    let ledger = service
+        .request(
+            "ledger",
+            json!({"account_id":account,"from":null,"to":null}),
+        )
+        .unwrap();
+    assert_eq!(ledger["closing_minor"], "0");
+}
+
+#[test]
+fn initial_itc_deferral_stages_purchase_and_hold_atomically_with_stable_retries() {
+    let (mut s, p, _, v) = books();
+    let account = s
+        .create_account(AccountInput {
+            code: "1490".into(),
+            name: "Initial pending".into(),
+            kind: ledger_core::AccountKind::Asset,
+        })
+        .unwrap()
+        .id;
+    let input = DeferredPurchaseInput {
+        document: invoice("purchase", v.id, "initial-pending-purchase", "29"),
+        pending_account_id: account,
+        reason: "Reviewed potential recoverability and temporary reversal conditions".into(),
+        eligibility_reviewed: true,
+    };
+    let mut bad = input.clone();
+    bad.pending_account_id = p.input.cgst;
+    assert!(s.deferred_purchase(bad, true).is_err());
+    assert_eq!(s.snapshot().unwrap().journal_count, 0);
+    let preview = s.deferred_purchase(input.clone(), false).unwrap();
+    assert_eq!(s.snapshot().unwrap().journal_count, 0);
+    assert_eq!(preview["postings"].as_array().unwrap().len(), 2);
+    let posted = s.deferred_purchase(input.clone(), true).unwrap();
+    assert_eq!(posted, s.deferred_purchase(input.clone(), true).unwrap());
+    assert_eq!(s.snapshot().unwrap().journal_count, 2);
+    assert_eq!(
+        s.ledger(p.input.cgst, None, None).unwrap().closing_minor,
+        "0"
+    );
+    assert_eq!(
+        s.ledger(account, None, None).unwrap().closing_minor,
+        "18000"
+    );
+    let draft = s
+        .gst_return_draft(GstReturnQuery {
+            period: "2026-10".into(),
+            frequency: "monthly".into(),
+        })
+        .unwrap();
+    assert_eq!(draft.gstr3b_draft_4_a_5.cgst_minor, "9000");
+    assert_eq!(draft.gstr3b_draft_4_b_2.cgst_minor, "9000");
+    assert_eq!(draft.gstr3b_draft_4_c.cgst_minor, "0");
+    assert!(draft.reconciled);
+    let mut restored = LedgerStore::memory().unwrap();
+    restored.restore(&s.export_backup().unwrap()).unwrap();
+    assert_eq!(
+        posted,
+        restored.deferred_purchase(input.clone(), true).unwrap()
+    );
+    let mut changed = input;
+    changed.reason = "Changed original review".into();
+    assert!(s.deferred_purchase(changed, true).is_err());
+    assert_eq!(s.snapshot().unwrap().journal_count, 2);
 }

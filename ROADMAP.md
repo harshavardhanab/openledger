@@ -25,7 +25,8 @@ See [accounting workflows](docs/ACCOUNTING.md) for posting rules and correction 
 - [x] Scoped India regular GST specification, reviewed rates/HSN, exact CGST/SGST-or-UTGST/IGST postings and an accounting register. See [India GST scope](docs/INDIA_GST.md).
 - [x] Monthly/quarterly GST return preparation with draft GSTR-1 candidate CSVs, GSTR-3B book worksheets, HSN review, control reconciliation and explicit unresolved items. See [return preparation](docs/GST_RETURNS.md).
 - [x] Explicit nil-rated/exempt/non-GST sales and purchases with review basis, bill-of-supply exports, classified returns, EXEMP and GSTR-3B 3.1(c/e)/table 5 book worksheets.
-- [x] Reviewed blocked/apportioned purchase ITC, nonrecoverable expense/inventory cost, credit-bounded supplier returns and explicit gross/reversal/ineligible draft mappings. Deferred recognition remains pending.
+- [x] Reviewed blocked/apportioned purchase ITC, nonrecoverable expense/inventory cost, credit-bounded supplier returns and explicit gross/reversal/ineligible draft mappings. Initial holding, temporary reversals and linked reclaims are implemented below.
+- [x] Atomic purchase/initial ITC holding, reviewed temporary reversals, bounded partial linked reclaims, pending-account isolation, effective-date register/table-4 draft reporting and validated backup history. Pending-ITC supplier returns and permanent later eligibility changes remain follow-ups.
 - [ ] Independent India tax verification, statutory return payloads/filing and special tax workflows outside that scope. Tracked in [#3](https://github.com/harshavardhanab/openledger/issues/3).
 - [x] Documented native import/export formats and atomic journal-import preview/commit.
 - [x] Separately designed, experimental Tally general-voucher XML adapter with explicit mapping, preview, atomic commit, stable source IDs and rejection of unsupported data. See [import/export contracts](docs/IMPORT_EXPORT.md).

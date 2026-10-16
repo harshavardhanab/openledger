@@ -538,14 +538,47 @@ impl LedgerStore {
                 rows.push(serde_json::json!({"document_id":d.id,"number":d.number,"original_invoice":source.as_ref().map(|s| &s.number),"supplier_reference":g.supplier_reference,"kind":d.input.kind,"classification":g.classification.as_ref().map(|c|c.kind.as_str()).unwrap_or("regular"),"classification_basis":g.classification.as_ref().map(|c|c.reason.as_str()),"itc_allocation":g.itc_allocation,"date":date,"event":event,"sign":sign,"counterparty_gstin":g.counterparty_gstin,"supply_state":g.supply_state,"supply_state_name":g.supply_state_name,"amounts":calc}));
             }
         }
+        let mut adjustments = vec![];
+        for a in crate::itc::records(&self.conn)? {
+            if a.input.date.as_str() < from || a.input.date.as_str() > to {
+                continue;
+            }
+            let sign = if a.input.deferral_id.is_some() {
+                1i128
+            } else {
+                -1
+            };
+            let total = totals.entry("purchase".into()).or_default();
+            for (i, n) in [&a.input.cgst, &a.input.sgst, &a.input.igst]
+                .into_iter()
+                .enumerate()
+            {
+                let n = if ["0", "0.0", "0.00"].contains(&n.as_str()) {
+                    0
+                } else {
+                    parse_amount(n)?
+                };
+                match i {
+                    0 => total.1 += sign * i128::from(n),
+                    1 => total.2 += sign * i128::from(n),
+                    _ => total.3 += sign * i128::from(n),
+                }
+            }
+            adjustments.push(a);
+        }
         let totals=totals.into_iter().map(|(k,(b,c,s,i))|(k,serde_json::json!({"taxable_minor":b.to_string(),"cgst_minor":c.to_string(),"sgst_minor":s.to_string(),"igst_minor":i.to_string()}))).collect::<std::collections::BTreeMap<_,_>>();
         Ok(
-            serde_json::json!({"from":from,"to":to,"rows":rows,"totals":totals,"filing_ready":false}),
+            serde_json::json!({"from":from,"to":to,"rows":rows,"itc_adjustments":adjustments,"totals":totals,"filing_ready":false}),
         )
     }
 }
 
 pub(crate) fn check_gst_control(tx: &Transaction<'_>, id: i64) -> Result<()> {
+    if crate::itc::pending_account(tx, id)? {
+        return Err(invalid(
+            "Pending ITC accounts are reserved for linked ITC adjustments.",
+        ));
+    }
     let raw: Option<String> = tx
         .query_row("SELECT data FROM gst_profile WHERE id=1", [], |r| r.get(0))
         .optional()?;

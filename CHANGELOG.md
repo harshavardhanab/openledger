@@ -2,6 +2,7 @@
 
 ## Unreleased roadmap implementation
 
+- Atomic purchase/initial ITC holding, temporary reversals, partial linked reclaims, pending-account isolation and effective-date draft table-4 reporting.
 - Customers and suppliers; exact sales/purchase invoices and linked partial settlements.
 - Reviewed blocked/apportioned purchase ITC, nonrecoverable cost, exact supplier-return credit allocations and draft permanent/excluded return mappings.
 - Explicit nil-rated/exempt/non-GST sales and purchases, reviewed classification/supplier state, bill-of-supply exports and classified return/draft reporting.
@@ -12,7 +13,7 @@
 - Fractional inventory, perpetual weighted average costing and paginated movement history.
 - Profit/loss and balance sheet reports, bank reconciliation, period closing and carry-forward.
 - Separate company/example files with persistent switching and locale preferences.
-- Schema/backup version 6 with version 1/2/3/4/5 compatibility, linked-record validation and stable posting-line IDs.
+- Schema/backup version 7 with version 1/2/3/4/5/6 compatibility, linked-record validation and stable posting-line IDs.
 - Experimental Tally XML general-voucher adapter with mapping, preview, staged commit and defensive parsing.
 - Atomic journal batch imports; paginated lists and large-book regression.
 - WCAG automated page/form checks, stronger contrast, forced colors, skip navigation and narrow reflow/keyboard checks.

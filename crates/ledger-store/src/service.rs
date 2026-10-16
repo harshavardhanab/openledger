@@ -53,6 +53,23 @@ impl LedgerService {
             )
         })?;
         Ok(match command {
+            "preview_deferred_purchase" => {
+                store.deferred_purchase(serde_json::from_value(payload)?, false)?
+            }
+            "post_deferred_purchase" => {
+                store.deferred_purchase(serde_json::from_value(payload)?, true)?
+            }
+            "itc_adjustments" => {
+                let input: ItcQuery = serde_json::from_value(payload)?;
+                serde_json::to_value(store.itc_adjustments(input.invoice_id)?)?
+            }
+            "preview_itc_adjustment" => {
+                let p = store.preview_itc_adjustment(serde_json::from_value(payload)?)?;
+                json!({"lines":p.lines.iter().map(|l|json!({"account_id":l.account_id,"side":l.side,"amount_minor":l.amount_minor.to_string()})).collect::<Vec<_>>()})
+            }
+            "post_itc_adjustment" => {
+                serde_json::to_value(store.post_itc_adjustment(serde_json::from_value(payload)?)?)?
+            }
             "books" => {
                 let parent = self.default_path.parent().unwrap_or(Path::new("."));
                 let mut books = vec![];
@@ -448,4 +465,10 @@ fn import_entries(
         store.replace_with(&stage)?;
     }
     Ok(json!({"count":ids.len(),"trial_balance":tb}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ItcQuery {
+    invoice_id: i64,
 }

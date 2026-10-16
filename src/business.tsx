@@ -1,3 +1,4 @@
+import { ItcAdjustments } from './itc';
 import { GstReturns } from './gst-returns';
 import React, { useEffect, useState, useId, useRef } from 'react';
 import {
@@ -482,6 +483,18 @@ function Documents(
           )}
           <SupplyClass gst={detail.input.gst || detail.correction?.original_gst} />
           {detail.gst && <GstAmounts calc={detail.gst} currency={currency} />}
+          {detail.input.kind === 'purchase' &&
+            detail.input.gst &&
+            !detail.input.gst.classification &&
+            !detail.reversed && (
+              <ItcAdjustments
+                key={detail.id}
+                invoice={detail}
+                state={state}
+                busy={busy}
+                mutate={mutate}
+              />
+            )}
           <p>{detail.input.note}</p>
           <strong>Total: {money(detail.total_minor, currency)}</strong>
           <div className="business-actions">
@@ -974,7 +987,13 @@ function DocumentComposer({
     [creditReviewed, setCreditReviewed] = useState(false),
     [itcMode, setItcMode] = useState('eligible'),
     [itcBasis, setItcBasis] = useState(''),
-    [itcReturnTreatment, setItcReturnTreatment] = useState('');
+    [itcReturnTreatment, setItcReturnTreatment] = useState(''),
+    [holdItc, setHoldItc] = useState(false),
+    [pendingItcAccount, setPendingItcAccount] = useState(0),
+    [holdItcBasis, setHoldItcBasis] = useState(''),
+    [reviewingHold, setReviewingHold] = useState(false),
+    [holdPreview, setHoldPreview] = useState<{ postings: Journal[] } | null>(null);
+  const holdRequest = useRef('');
   const gstInput: GstInput = {
     ...(kind === 'purchase' && supplyKind === 'regular' && itcMode !== 'eligible'
       ? {
@@ -1064,6 +1083,14 @@ function DocumentComposer({
     lines: settlement ? [] : lines.map(({ gst_rate, hsn_sac, itc_rate, ...line }) => line),
     request_id: requestId,
   };
+  const holdActive = kind === 'purchase' && gstEnabled && supplyKind === 'regular' && holdItc;
+  const heldPayload = {
+    document: payload,
+    pending_account_id: pendingItcAccount,
+    reason: holdItcBasis,
+    eligibility_reviewed: creditReviewed,
+  };
+  holdRequest.current = JSON.stringify(heldPayload);
   const total = settlement
     ? parseMinor(amount) || 0n
     : lines.reduce((v, l) => v + lineTotal(l), 0n) +
@@ -1076,7 +1103,15 @@ function DocumentComposer({
   const draftKey = `open-ledger-draft:${state.company!.created_at}:${state.company!.name}:${kind}`;
   const saveDraft = () => {
     try {
-      localStorage.setItem(draftKey, JSON.stringify(payload));
+      localStorage.setItem(
+        draftKey,
+        JSON.stringify({
+          ...payload,
+          ...(holdActive
+            ? { local_itc_hold: { pending_account_id: pendingItcAccount, reason: holdItcBasis } }
+            : {}),
+        }),
+      );
     } catch (e) {
       onError(`Draft could not be saved on this device: ${err(e)}`);
     }
@@ -1085,7 +1120,9 @@ function DocumentComposer({
     try {
       const raw = localStorage.getItem(draftKey);
       if (!raw) return;
-      const d = JSON.parse(raw) as DocInput;
+      const d = JSON.parse(raw) as DocInput & {
+        local_itc_hold?: { pending_account_id: number; reason: string };
+      };
       if (
         d.kind !== kind ||
         typeof d.date !== 'string' ||
@@ -1139,6 +1176,9 @@ function DocumentComposer({
         setItcBasis(d.gst.itc_allocation?.reason || '');
         setItcReturnTreatment(d.gst.itc_allocation?.return_treatment || '');
       }
+      setHoldItc(Boolean(d.local_itc_hold));
+      setPendingItcAccount(d.local_itc_hold?.pending_account_id || 0);
+      setHoldItcBasis(d.local_itc_hold?.reason || '');
       setRequestId(d.request_id);
     } catch {
       /* A damaged local draft does not affect books. */
@@ -1171,6 +1211,26 @@ function DocumentComposer({
             </p>
           )}
           <p>Review before posting. Posted documents are immutable.</p>
+          {holdActive && holdPreview && (
+            <>
+              <p>
+                The purchase and same-date temporary ITC reversal will be saved together. Reviewed
+                recoverable credit stays in the pending account until a linked reclaim.
+              </p>
+              {holdPreview.postings.map((journal, i) => (
+                <div key={i}>
+                  <h4>{i === 0 ? 'Purchase posting' : 'Pending ITC posting'}</h4>
+                  <ul>
+                    {journal.lines.map((line, n) => (
+                      <li key={n}>
+                        {line.side} · {line.account_name} · {money(line.amount_minor, currency)}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </>
+          )}
           <p>
             {displayDate(date)} · {data.parties.find((p) => p.id === party)?.input.name}{' '}
             {due && !settlement && !stock ? `· Due ${displayDate(due)}` : ''}
@@ -1198,7 +1258,13 @@ function DocumentComposer({
               className="button primary"
               disabled={busy}
               onClick={async () => {
-                if (await mutate('post_document', payload, 'Document posted.')) {
+                if (
+                  await mutate(
+                    holdActive ? 'post_deferred_purchase' : 'post_document',
+                    holdActive ? heldPayload : payload,
+                    holdActive ? 'Purchase and pending ITC posted together.' : 'Document posted.',
+                  )
+                ) {
                   try {
                     localStorage.removeItem(draftKey);
                   } catch {
@@ -1214,9 +1280,28 @@ function DocumentComposer({
         </>
       ) : (
         <form
-          onSubmit={(e) => {
+          onSubmit={async (e) => {
             e.preventDefault();
-            setReview(true);
+            if (!holdActive) {
+              setReview(true);
+              return;
+            }
+            setReviewingHold(true);
+            const serialized = holdRequest.current;
+            try {
+              const preview = await request<{ postings: Journal[] }>(
+                'preview_deferred_purchase',
+                heldPayload,
+              );
+              if (serialized === holdRequest.current) {
+                setHoldPreview(preview);
+                setReview(true);
+              }
+            } catch (e) {
+              onError(err(e));
+            } finally {
+              setReviewingHold(false);
+            }
           }}
         >
           <div className="business-grid">
@@ -1466,6 +1551,51 @@ function DocumentComposer({
                     </div>
                   )}
                   {kind === 'purchase' && supplyKind === 'regular' && (
+                    <>
+                      <label className="checkbox-label">
+                        <input
+                          type="checkbox"
+                          checked={holdItc}
+                          onChange={(e) => setHoldItc(e.target.checked)}
+                        />
+                        Hold reviewed recoverable ITC pending
+                      </label>
+                      {holdItc && (
+                        <div className="business-grid">
+                          <Field name="Initial pending ITC asset account">
+                            <select
+                              required
+                              value={pendingItcAccount || ''}
+                              onChange={(e) => setPendingItcAccount(Number(e.target.value))}
+                            >
+                              <option value="">Select dedicated asset account</option>
+                              {state.accounts
+                                .filter((a) => a.kind === 'asset')
+                                .map((a) => (
+                                  <option key={a.id} value={a.id}>
+                                    {a.code} · {a.name}
+                                  </option>
+                                ))}
+                            </select>
+                          </Field>
+                          <Field name="Initial ITC deferral basis">
+                            <input
+                              required
+                              maxLength={500}
+                              value={holdItcBasis}
+                              onChange={(e) => setHoldItcBasis(e.target.value)}
+                            />
+                          </Field>
+                          <p className="form-hint">
+                            The purchase and temporary reversal are saved atomically. Review
+                            potential recoverability and temporary reversal conditions; this option
+                            does not establish entitlement or calculate interest.
+                          </p>
+                        </div>
+                      )}
+                    </>
+                  )}
+                  {kind === 'purchase' && supplyKind === 'regular' && (
                     <label className="checkbox-label">
                       <input
                         required
@@ -1631,8 +1761,8 @@ function DocumentComposer({
             </>
           )}
           <div className="business-actions">
-            <button className="button primary" disabled={busy}>
-              Review document
+            <button className="button primary" disabled={busy || reviewingHold}>
+              {reviewingHold ? 'Preparing ITC review…' : 'Review document'}
             </button>
             {!settlement && !stock && (
               <>
@@ -2740,6 +2870,18 @@ function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) =
   const [from, setFrom] = useState(state.company!.fiscal_year_start),
     [to, setTo] = useState(today()),
     [report, setReport] = useState<{
+      itc_adjustments: {
+        id: number;
+        input: {
+          invoice_id: number;
+          deferral_id: number | null;
+          date: string;
+          cgst: string;
+          sgst: string;
+          igst: string;
+          reason: string;
+        };
+      }[];
       rows: {
         number: string;
         kind: string;
@@ -2856,6 +2998,29 @@ function GstReport({ state, onError }: { state: Snapshot; onError: (s: string) =
                     r.itc_allocation?.reason || '',
                   ]),
                 ),
+                ...report.itc_adjustments.map((a) => [
+                  `ITC/${a.id}`,
+                  'purchase',
+                  a.input.date,
+                  a.input.deferral_id === null ? 'temporary_itc_reversal' : 'itc_reclaim',
+                  String(a.input.invoice_id),
+                  '',
+                  '',
+                  '',
+                  '',
+                  '',
+                  '',
+                  '',
+                  '0',
+                  '0',
+                  '0',
+                  '0',
+                  ...[a.input.cgst, a.input.sgst, a.input.igst].map((n) =>
+                    ((parseMinor(n) ?? 0n) * (a.input.deferral_id === null ? -1n : 1n)).toString(),
+                  ),
+                  a.input.deferral_id === null ? 'temporary_4b2' : 'reclaim_4a5_4d1',
+                  a.input.reason,
+                ]),
               ]),
               'text/csv',
             )

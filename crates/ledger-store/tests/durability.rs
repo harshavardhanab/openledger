@@ -145,7 +145,7 @@ fn return_schema_rebuild_rolls_back_atomically_and_preserves_child_references() 
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
     let fk: String = conn
         .query_row(
@@ -170,4 +170,39 @@ fn return_schema_rebuild_rolls_back_atomically_and_preserves_child_references() 
         fiscal_year_start: "2026-04-01".into(),
     })
     .unwrap();
+}
+
+#[test]
+fn itc_table_migration_is_transactional_and_preserves_v6_books() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("itc-migration.sqlite");
+    drop(LedgerStore::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE itc_adjustments; PRAGMA user_version=6; CREATE INDEX itc_adjustments_invoice ON accounts(code)").unwrap();
+    drop(conn);
+    assert!(LedgerStore::open(&path).is_err());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        6
+    );
+    let table: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='itc_adjustments')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!table);
+    conn.execute_batch("DROP INDEX itc_adjustments_invoice")
+        .unwrap();
+    drop(conn);
+    drop(LedgerStore::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
 }

@@ -1,5 +1,12 @@
 # Roadmap implementation validation — 16 October 2026
 
+## Linked pending ITC extension
+
+- 66 locked Rust tests pass, including atomic initial holding, unchanged destination on failed holding, partial linked reclaims across periods, per-component limits, permanent-allocation bounds, pending-account isolation, closing-date protection, exact amounts above JavaScript's safe integer range, replay/tamper rejection and transactional version-7 migration rollback.
+- All 32 Chromium/WebKit browser executions pass. The new interface workflow previews/posts temporary reversals and partial linked reclaims, exports history, verifies table-4/reconciliation, restores the backup, and posts an initially held purchase with both journals saved together. Automated accessibility checks include the adjustment form and posting preview.
+- Strict TypeScript/Vite, Cargo formatting and Clippy with warnings denied pass locally. Schema/backup version 7 reads versions 1–6; GST draft format version 3 adds linked ITC source events and reviewed temporary/reclaim/net table-4 fields. No dependencies were added.
+- Native candidate/package checks for this extension are in progress. The completed version-6 evidence below does not validate the new source. Independent tax review and GST Portal acceptance remain open.
+
 ## GST preparation, classifications and input-credit extension
 
 The current extension provides monthly/quarterly GSTR-1 candidate CSVs, GSTR-3B preparation worksheets, source-level tax review and six-account reconciliation. Explicit nil-rated/exempt/non-GST supplies, reviewed blocked/apportioned purchase ITC, nonrecoverable purchase cost and exact linked returns are included. The official template provenance and precise boundaries are in [GST_RETURNS.md](docs/GST_RETURNS.md) and [INDIA_GST.md](docs/INDIA_GST.md).
@@ -9,7 +16,9 @@ The current extension provides monthly/quarterly GSTR-1 candidate CSVs, GSTR-3B 
 - Strict TypeScript/Vite, formatting and Clippy with warnings denied pass locally. Schema/backup version 6 reads versions 1–5. Draft format version 2 distinguishes reviewed gross/reversal/ineligible return candidates from recoverable book tax and includes source invoice/line detail.
 - The preceding version-5 application at `61f59d1` passed the [full macOS/Windows/Linux build/test matrix](https://github.com/harshavardhanab/openledger/actions/runs/38842255311). Version-5 packaging at `83590ed` passed for [all three platforms](https://github.com/harshavardhanab/openledger/actions/runs/38841463787). These runs do not validate later ITC-allocation source.
 - The macOS ARM64 `83590ed` candidate built (10.22 MiB), passed ad hoc signature verification and migrated an isolated synthetic schema-4 profile to version 5. Native UI entry posted a 100.00 exempt bill of supply with zero tax. Native save dialogs exported JSON/EXEMP CSV with matching 3.1(c) values, zero control differences and three correctly unclassified older purchase/return records. The database retained nine journals and valid foreign keys.
-- Fresh native build, platform CI and installed-package evidence are required for version-6 source. Independent tax review and GST Portal acceptance remain open; these are preparation drafts.
+- Source `c6c25e3` completed the [full macOS/Windows/Linux matrix](https://github.com/harshavardhanab/openledger/actions/runs/38843962797), [three-platform packages](https://github.com/harshavardhanab/openledger/actions/runs/38843958283) and [installed NSIS/Debian/AppImage tests](https://github.com/harshavardhanab/openledger/actions/runs/38878052592). The Windows package job succeeded after retrying a crates.io connection-reset failure before compilation. These runs validate version-6 source, not subsequent linked-ITC changes.
+- The local macOS ARM64 `c6c25e3` app built (10.28 MiB) and passed ad hoc signature verification. Native UI posted a synthetic 1,000.00 purchase with 50% reviewed ITC: 45.00 CGST + 45.00 SGST recoverable, 90.00 nonrecoverable cost and 1,180.00 payable. Draft 4(A)(5) showed 90.00 per component and 4(B)(1) showed 45.00, with all controls reconciled. Native save dialogs exported version-2 draft JSON and a version-6 ten-journal backup. Native restore preserved ten entries and created a ten-entry recovery backup; foreign keys validated.
+- Independent tax review and GST Portal acceptance remain open; these are preparation drafts.
 
 ## Returns and accessibility extension — earlier source
 

@@ -146,6 +146,10 @@ pub struct GstReturnDraft {
     pub gstr3b_book_3_1_e: ReturnAmounts,
     pub gstr3b_draft_4_a_5: ReturnAmounts,
     pub gstr3b_draft_4_b_1: ReturnAmounts,
+    pub gstr3b_draft_4_b_2: ReturnAmounts,
+    pub gstr3b_draft_4_d_1: ReturnAmounts,
+    pub gstr3b_draft_4_c: ReturnAmounts,
+    pub itc_adjustments: Vec<crate::ItcAdjustment>,
     pub gstr3b_draft_4_d_2: ReturnAmounts,
     pub book_recoverable_input_tax: ReturnAmounts,
     pub input_tax_rows: Vec<InputTaxReview>,
@@ -331,7 +335,7 @@ impl LedgerStore {
             .collect::<BTreeMap<_, _>>();
         let mut out = GstReturnDraft {
             format: "open-ledger-gst-return-draft",
-            version: 2,
+            version: 3,
             query,
             from: from.clone(),
             to: to.clone(),
@@ -347,6 +351,10 @@ impl LedgerStore {
             gstr3b_book_3_1_e: amounts([0; 4]),
             gstr3b_draft_4_a_5: amounts([0; 4]),
             gstr3b_draft_4_b_1: amounts([0; 4]),
+            gstr3b_draft_4_b_2: amounts([0; 4]),
+            gstr3b_draft_4_d_1: amounts([0; 4]),
+            gstr3b_draft_4_c: amounts([0; 4]),
+            itc_adjustments: vec![],
             gstr3b_draft_4_d_2: amounts([0; 4]),
             book_recoverable_input_tax: amounts([0; 4]),
             input_tax_rows: vec![],
@@ -778,6 +786,39 @@ impl LedgerStore {
                 intra_state_minor: n[1].to_string(),
             })
             .collect();
+        let mut temporary = [0i128; 4];
+        let mut reclaimed = [0i128; 4];
+        for a in crate::itc::records(&self.conn)? {
+            if a.input.date < from || a.input.date > to {
+                continue;
+            }
+            if from.as_str() < "2022-09-01" {
+                out.issues.push(ReturnIssue { code:format!("unmapped_itc_adjustment_{}",a.id), document_id:Some(a.input.invoice_id), reference:format!("ITC/{}",a.id), message:"Temporary ITC reversal/reclaim is shown in books; review the historical table-4 format before mapping this period.".into() });
+            } else {
+                for (i, n) in [&a.input.cgst, &a.input.sgst, &a.input.igst]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let value = if ["0", "0.0", "0.00"].contains(&n.as_str()) {
+                        0
+                    } else {
+                        i128::from(ledger_core::parse_amount(n)?)
+                    };
+                    if a.input.deferral_id.is_some() {
+                        reclaimed[i + 1] += value;
+                        mapped_itc[0][i + 1] += value;
+                    } else {
+                        temporary[i + 1] += value;
+                    }
+                }
+            }
+            out.itc_adjustments.push(a);
+        }
+        out.gstr3b_draft_4_b_2 = amounts(temporary);
+        out.gstr3b_draft_4_d_1 = amounts(reclaimed);
+        out.gstr3b_draft_4_c = amounts(std::array::from_fn(|i| {
+            mapped_itc[0][i] - mapped_itc[1][i] - temporary[i]
+        }));
         out.gstr3b_draft_4_a_5 = amounts(mapped_itc[0]);
         out.gstr3b_draft_4_b_1 = amounts(mapped_itc[1]);
         out.gstr3b_draft_4_d_2 = amounts(mapped_itc[2]);
@@ -853,7 +894,7 @@ impl LedgerStore {
                     difference_minor: difference.to_string(),
                 });
                 // Net-zero manual entries still need review, even when reconciliation balances.
-                let mut q = self.conn.prepare("SELECT DISTINCT j.id,j.reference FROM journals j JOIN lines l ON l.journal_id=j.id WHERE l.account_id=?1 AND j.date>=?2 AND j.date<=?3 AND NOT EXISTS(SELECT 1 FROM documents d WHERE d.journal_id=COALESCE(j.reversal_of,j.id) AND json_extract(d.data,'$.gst') IS NOT NULL)")?;
+                let mut q = self.conn.prepare("SELECT DISTINCT j.id,j.reference FROM journals j JOIN lines l ON l.journal_id=j.id WHERE l.account_id=?1 AND j.date>=?2 AND j.date<=?3 AND NOT EXISTS(SELECT 1 FROM documents d WHERE d.journal_id=COALESCE(j.reversal_of,j.id) AND json_extract(d.data,'$.gst') IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM itc_adjustments a WHERE a.journal_id=j.id)")?;
                 for r in q.query_map(params![id, from, to], |r| {
                     Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
                 })? {
@@ -937,6 +978,24 @@ impl LedgerStore {
             "Draft reviewed permanent reversals",
             "",
             &out.gstr3b_draft_4_b_1,
+        )))
+        .chain(std::iter::once((
+            "4(B)(2)",
+            "Draft reviewed temporary reversals",
+            "",
+            &out.gstr3b_draft_4_b_2,
+        )))
+        .chain(std::iter::once((
+            "4(D)(1)",
+            "Draft linked reclaims also included in 4(A)(5)",
+            "",
+            &out.gstr3b_draft_4_d_1,
+        )))
+        .chain(std::iter::once((
+            "4(C)",
+            "Draft net mapped ITC; reconcile entitlement independently",
+            "",
+            &out.gstr3b_draft_4_c,
         )))
         .chain(std::iter::once((
             "4(D)(2)",

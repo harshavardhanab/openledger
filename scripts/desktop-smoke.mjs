@@ -252,7 +252,7 @@ try {
     contact: '',
     account_id: 5,
   });
-  await invoke('post_document', {
+  const taxPurchase = await invoke('post_document', {
     ...invoiceInput,
     kind: 'purchase',
     party_id: taxSupplier.id,
@@ -280,15 +280,51 @@ try {
     ],
     request_id: 'native-apportioned',
   });
+  const pendingItc = await invoke('create_account', {
+    code: '1490',
+    name: 'Pending native ITC',
+    kind: 'asset',
+  });
+  const deferredInput = {
+    invoice_id: taxPurchase.id,
+    deferral_id: null,
+    pending_account_id: pendingItc.id,
+    date: '2026-10-05',
+    cgst: '1',
+    sgst: '1',
+    igst: '0',
+    reason: 'Synthetic reviewed temporary reversal',
+    eligibility_reviewed: true,
+    request_id: 'native-defer',
+  };
+  const itcPreview = await invoke('preview_itc_adjustment', deferredInput);
+  assert.equal(itcPreview.lines[0].amount_minor, '100');
+  const deferral = await invoke('post_itc_adjustment', deferredInput);
+  await invoke('post_itc_adjustment', {
+    ...deferredInput,
+    deferral_id: deferral.id,
+    date: '2026-10-06',
+    cgst: '0.50',
+    sgst: '0.50',
+    reason: 'Synthetic reviewed partial reclaim',
+    request_id: 'native-reclaim',
+  });
+  assert.equal(
+    (await invoke('itc_adjustments', { invoice_id: taxPurchase.id }))[0].remaining.cgst_minor,
+    '50',
+  );
   const taxDraft = await invoke('gst_return_draft', { period: '2026-10', frequency: 'monthly' });
-  assert.equal(taxDraft.book_recoverable_input_tax.cgst_minor, '450');
+  assert.equal(taxDraft.book_recoverable_input_tax.cgst_minor, '400');
   assert.equal(taxDraft.gstr3b_book_3_1_a.taxable_minor, '10000');
   assert.equal(taxDraft.gstr3b_book_3_1_c.taxable_minor, '5000');
   assert.equal(taxDraft.gstr1_sections.exemp.taxable_minor, '5000');
+  assert.equal(taxDraft.gstr3b_draft_4_b_2.cgst_minor, '100');
+  assert.equal(taxDraft.gstr3b_draft_4_d_1.cgst_minor, '50');
+  assert.equal(taxDraft.gstr3b_draft_4_c.cgst_minor, '400');
   assert.equal(taxDraft.reconciled, true);
   assert.equal(taxDraft.filing_ready, false);
   const classifiedBackup = await invoke('backup');
-  assert.equal(JSON.parse(classifiedBackup).version, 6);
+  assert.equal(JSON.parse(classifiedBackup).version, 7);
   await invoke('restore_backup', { contents: classifiedBackup });
   assert.deepEqual(
     await invoke('gst_return_draft', { period: '2026-10', frequency: 'monthly' }),
