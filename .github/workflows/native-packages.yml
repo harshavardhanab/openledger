@@ -48,7 +48,7 @@ jobs:
           git merge-base --is-ancestor "$sha" HEAD
           git diff --exit-code "$sha" HEAD -- crates src src-tauri Cargo.toml Cargo.lock package.json package-lock.json
           echo "Testing installed packages built from $sha" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: open-ledger-${{ runner.os }}-X64
           run-id: ${{ inputs.package_run_id }}
